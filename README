@@ -1,0 +1,765 @@
+# Bonobo
+
+Bonobo é uma linguagem pequena, compilada para assembly NASM x86-64 em
+ambientes Linux. O compilador implementa um pipeline direto:
+
+```text
+arquivo .bon
+	-> expansão de include.bon
+	-> lexer
+	-> parser recursivo descendente
+	-> AST
+	-> gerador de assembly NASM
+	-> NASM + LD (opcional)
+```
+
+Este documento descreve a sintaxe que o código atual aceita, apresenta um
+tutorial curto e registra as limitações conhecidas da implementação.
+
+## Estado do projeto
+
+A linguagem já possui suporte sintático para:
+
+- variáveis locais e globais;
+- atribuições;
+- números inteiros e strings;
+- expressões aritméticas, relacionais e bit a bit;
+- funções com parâmetros;
+- chamadas de funções;
+- `if`/`else`, `while` e `for`;
+- `return`;
+- blocos de assembly embutido;
+- arquivos de inclusão por meio de `include.bon`.
+
+O backend gera assembly para Linux x86-64 usando a convenção de chamada
+System V AMD64. O programa gerado começa em `_start`, chama `func_main` e
+termina usando a syscall `exit` com o valor retornado por `func_main`.
+
+## Requisitos
+
+Para gerar somente o assembly, é necessário Python 3. Para montar e linkar um
+executável, também são necessários:
+
+- NASM;
+- `ld` do toolchain GNU/binutils;
+- Linux x86-64.
+
+O compilador usa apenas módulos da biblioteca padrão do Python.
+
+## Como executar
+
+O ponto de entrada é `src/main.py`. Como os imports são escritos para os
+módulos dentro de `src`, execute-o a partir da raiz do projeto desta forma:
+
+```bash
+PYTHONPATH=src python src/main.py caminho/para/programa.bon
+```
+
+Esse comando gera `caminho/para/programa.asm`.
+
+Para também montar e linkar:
+
+```bash
+PYTHONPATH=src python src/main.py caminho/para/programa.bon --compile
+```
+
+O executável será criado no mesmo caminho-base do arquivo `.bon` e o arquivo
+objeto intermediário será removido após o link. O caminho do arquivo-fonte é
+obrigatório. A opção `-c` é um alias de `--compile`.
+
+## Primeiro programa
+
+Crie `hello.bon`:
+
+```bonobo
+def main() {
+	return 0;
+}
+```
+
+Compile para assembly:
+
+```bash
+PYTHONPATH=src python src/main.py hello.bon
+```
+
+O nome da função `main` não é obrigatório para a entrada do programa. Todo
+código escrito fora de uma função é colocado automaticamente em uma função
+sintética chamada `func_main`. A função `main` acima é uma função comum; para
+que o código global seja executado, basta escrever:
+
+```bonobo
+let result = 40 + 2;
+```
+
+Nesse caso, o valor final retornado por `func_main` é `0`, pois o gerador
+encerra o corpo sintético com `xor rax, rax`.
+
+## Comentários e espaço em branco
+
+Comentários de uma linha começam com `#` e vão até o fim da linha:
+
+```bonobo
+# Esta linha inteira é ignorada.
+let answer = 42;  # comentários também podem aparecer depois de código
+```
+
+Espaços, tabulações e quebras de linha são ignorados pelo lexer, exceto por
+separarem tokens. Não existe sintaxe de comentário de bloco.
+
+## Identificadores e palavras reservadas
+
+Um identificador começa com uma letra ASCII ou `_` e pode continuar com
+letras, dígitos e `_`:
+
+```text
+válido:   value, _temporary, item2, calcula_total
+inválido:  2items, nome-com-hifen
+```
+
+Os identificadores são sensíveis a maiúsculas e minúsculas. As palavras
+reservadas não podem ser usadas como identificadores porque são reconhecidas
+antes do token genérico `IDENT`:
+
+```text
+let  if  else  while  for  def  return  asm
+```
+
+## Tipos de literal
+
+### Números
+
+O lexer aceita números inteiros decimais formados por um ou mais dígitos:
+
+```bonobo
+let zero = 0;
+let count = 12345;
+let negative = -10;
+```
+
+O sinal não faz parte do literal: `-10` é uma operação unária aplicada ao
+número `10`. Literais hexadecimais, binários, números decimais com ponto e
+separadores numéricos não fazem parte da sintaxe atual.
+
+### Strings
+
+Strings são delimitadas por aspas duplas:
+
+```bonobo
+let message = "hello, bonobo";
+```
+
+O conteúdo é armazenado no assembly como uma sequência terminada em zero e
+produz um ponteiro para essa sequência. O lexer atual não implementa escapes
+como `\\n`, `\\"` ou `\\\\`; uma string termina na próxima aspa dupla.
+
+## Declarações e atribuições
+
+### Declaração simples
+
+Uma variável é declarada com `let`, um identificador, `=` e uma expressão,
+sempre terminada por `;`:
+
+```bonobo
+let first = 10;
+let second = first + 32;
+let text = "Bonobo";
+```
+
+No nível do arquivo, as variáveis são emitidas na seção `.bss`. Dentro de uma
+função, elas são armazenadas em slots relativos a `rbp`.
+
+### Declaração com conversor
+
+Existe uma forma abreviada para chamar uma função sobre o valor inicial:
+
+```bonobo
+let string(message) = 42;
+```
+
+Ela é interpretada como:
+
+```bonobo
+let message = string(42);
+```
+
+O primeiro identificador (`string` no exemplo) não é um tipo nativo. Ele é o
+nome de uma função que precisa estar definida no programa ou em um arquivo
+incluído.
+
+### Atribuição
+
+Uma atribuição usa um identificador à esquerda e uma expressão à direita:
+
+```bonobo
+let total = 1;
+total = total + 1;
+total = total * 10;
+```
+
+A atribuição é associativa à direita, portanto a forma `a = b = 3` é aceita
+pela gramática. O alvo precisa ser um identificador; expressões como
+`(a + b) = 1` são rejeitadas.
+
+## Funções
+
+Uma função possui `def`, nome, lista opcional de parâmetros e um bloco:
+
+```bonobo
+def add(left, right) {
+	return left + right;
+}
+
+let result = add(20, 22);
+```
+
+Cada função vira um label `func_<nome>` no assembly. Os seis primeiros
+parâmetros são recebidos nos registradores da convenção System V:
+
+```text
+1: rdi   2: rsi   3: rdx   4: rcx   5: r8   6: r9
+```
+
+Parâmetros posicionais são copiados para slots locais no prólogo da função.
+
+Uma função pode não ter parâmetros:
+
+```bonobo
+def answer() {
+	return 42;
+}
+
+let result = answer();
+```
+
+O parser também aceita `...` como parâmetro variádico:
+
+```bonobo
+def log(...) {
+	return 0;
+}
+```
+
+Na implementação atual, esse parâmetro é reconhecido pela sintaxe, mas não é
+materializado como uma coleção acessível no corpo da função. Argumentos além
+dos seis primeiros são empilhados pelo gerador de chamadas, sem uma API de
+acesso específica no código da função.
+
+### Chamadas
+
+Uma chamada é formada por um identificador seguido de parênteses:
+
+```bonobo
+let value = add(1, 2);
+print(value);
+```
+
+Somente identificadores podem ser chamados. Assim, `(factory)()` e
+`get_factory()()` não são aceitos pela gramática. O gerador exige que o nome
+chamado corresponda a uma função registrada no programa; chamar um nome não
+definido produz erro de geração de código.
+
+## Controle de fluxo
+
+Condições usam expressões inteiras. O valor zero é tratado como falso e
+qualquer valor diferente de zero como verdadeiro.
+
+### `if` e `else`
+
+```bonobo
+if (score >= 60) {
+	result = 1;
+} else {
+	result = 0;
+}
+```
+
+Os parênteses da condição e as chaves dos blocos são obrigatórios.
+A sintaxe de `else if` não existe; encadeie um `if` dentro do bloco `else`:
+
+```bonobo
+if (value < 0) {
+	result = -1;
+} else {
+	if (value == 0) {
+		result = 0;
+	} else {
+		result = 1;
+	}
+}
+```
+
+### `while`
+
+```bonobo
+let counter = 0;
+while (counter < 10) {
+	counter = counter + 1;
+}
+```
+
+O corpo do `while` é sempre um bloco entre `{` e `}`. Não há `break` nem
+`continue` na gramática atual.
+
+### `for`
+
+A forma geral é:
+
+```text
+for (inicialização; condição; atualização) { ... }
+```
+
+Exemplo com declaração:
+
+```bonobo
+for (let i = 0; i < 5; i = i + 1) {
+	total = total + i;
+}
+```
+
+A inicialização pode ser uma declaração `let`, uma expressão ou vazia. A
+condição e a atualização também podem ser omitidas:
+
+```bonobo
+for (; total < 10; ) {
+	total = total + 1;
+}
+```
+
+O parser aceita `for (;;)` como laço sem condição. Como não existe `break`, um
+laço assim só termina por outra lógica externa, como um `return` dentro de uma
+função.
+
+## `return`
+
+`return` aceita uma expressão opcional e exige `;`:
+
+```bonobo
+def with_value() {
+	return 7 * 6;
+}
+
+def without_value() {
+	return;
+}
+```
+
+Sem expressão, o gerador coloca zero em `rax`. Com expressão, o resultado é
+deixado em `rax` antes do retorno.
+
+## Expressões e operadores
+
+A gramática implementa a seguinte precedência, da maior para a menor:
+
+| Nível | Operadores | Associatividade |
+| --- | --- | --- |
+| 1 | chamada `f(...)`, literais, identificadores, `(expr)` | pós-fixada |
+| 2 | `+expr`, `-expr`, `~expr` | direita |
+| 3 | `*`, `/` | esquerda |
+| 4 | `+`, `-` | esquerda |
+| 5 | `<<`, `>>` | esquerda |
+| 6 | `&` | esquerda |
+| 7 | `^` | esquerda |
+| 8 | `\|` | esquerda |
+| 9 | `<`, `>`, `<=`, `>=` | esquerda |
+| 10 | `==`, `!=` | esquerda |
+| 11 | `=` | direita |
+
+Exemplo que usa a precedência:
+
+```bonobo
+let value = 2 + 3 * 4;       # 14
+let shifted = value << 1;    # deslocamento à esquerda
+let check = shifted >= 20;
+let bits = (value & 15) ^ 2;
+```
+
+### Operadores aritméticos
+
+São aceitos:
+
+```text
++   soma
+-   subtração
+*    multiplicação
+/    divisão inteira com sinal
+```
+
+O operador `/` usa `idiv`. Divisão por zero é um erro em tempo de execução do
+processador, não uma verificação feita pelo parser.
+
+### Operadores relacionais
+
+```text
+==   igual
+!=   diferente
+<    menor
+>    maior
+<=   menor ou igual
+>=   maior ou igual
+```
+
+O resultado de uma comparação é normalizado pelo assembly para `0` ou `1`.
+
+### Operadores bit a bit
+
+```text
+&    AND
+|    OR
+^    XOR
+~    complemento bit a bit
+<<   deslocamento à esquerda
+>>   deslocamento à direita
+```
+
+### Atribuição dentro de expressões
+
+Como `=` está no nível de expressão, ela pode aparecer onde uma expressão é
+esperada:
+
+```bonobo
+let a = 0;
+let b = 0;
+a = b = 5;
+```
+
+Apesar de ser sintaticamente válida, prefira atribuições isoladas para manter
+o código legível.
+
+## Assembly embutido
+
+O lexer reconhece blocos assembly delimitados por chaves. O conteúdo não é
+validado pelo parser de Bonobo e é inserido no assembly gerado, linha a linha.
+As formas disponíveis são:
+
+| Forma | Seção NASM | Uso |
+| --- | --- | --- |
+| `asm { ... }` | `.text` | Compatibilidade e código executável |
+| `asm_text { ... }` | `.text` | Código executável explícito |
+| `asm_data { ... }` | `.data` | Dados inicializados |
+| `asm_rodata { ... }` | `.rodata` | Dados inicializados somente para leitura |
+| `asm_bss { ... }` | `.bss` | Dados reservados sem inicialização |
+| `asm_return { ... }` | `.text` | Retorna o valor deixado em `rax` |
+
+Exemplo com código na seção `.text`:
+
+```bonobo
+asm {
+	mov rax, 42
+	add rax, 1
+};
+```
+
+O ponto e vírgula depois do bloco é opcional:
+
+```bonobo
+asm {
+	xor rax, rax
+}
+```
+
+Dados podem ser enviados diretamente às seções correspondentes:
+
+```bonobo
+asm_data {
+message: db "hello", 0
+message_len equ $ - message - 1
+}
+
+asm_rodata {
+constant: dq 42
+}
+
+asm_bss {
+buffer: resq 16
+}
+```
+
+Os blocos `asm_data`, `asm_rodata` e `asm_bss` não são colocados dentro de
+`func_main`; eles são acumulados e emitidos nas seções `.data`, `.rodata` e
+`.bss` do assembly final. `asm` e `asm_text` são emitidos em `.text`.
+
+### Retornando valores do assembly inline
+
+Use `asm_return` dentro de uma função quando o assembly inline produzir o
+valor que deve ser devolvido ao chamador:
+
+```bonobo
+def is_ready() {
+	asm_return {
+		mov rax, 1
+	}
+}
+
+let ready = is_ready();
+```
+
+`asm_return` usa a convenção de retorno System V AMD64: o resultado precisa
+estar em `rax` antes do fim do bloco. O compilador então emite o epílogo da
+função e a instrução `ret`. A chamada Bonobo encontra o resultado novamente em
+`rax`, portanto ele pode ser usado em uma declaração, atribuição ou como
+retorno de outra função:
+
+```bonobo
+def make_bool() {
+	asm_return {
+		xor rax, rax
+		cmp rdi, 0
+		setne al
+	}
+}
+
+def forward_bool() {
+	return make_bool();
+}
+
+let result = make_bool();
+```
+
+O mesmo mecanismo serve para ponteiros. Como uma string é representada por um
+endereço no assembly, `rax` pode receber um ponteiro para dados em `.data` ou
+`.rodata`:
+
+```bonobo
+asm_data {
+message: db "hello", 0
+}
+
+def message_pointer() {
+	asm_return {
+		lea rax, [message]
+	}
+}
+
+let pointer = message_pointer();
+```
+
+A convenção é deliberadamente explícita:
+
+```text
+entrada do asm_return:  assembly calcula o resultado
+registrador de retorno: rax
+saída para o chamador:  valor de rax após call
+```
+
+Para booleanos, deixe `rax` com `0` ou `1`. Para ponteiros, deixe em `rax` o
+endereço válido. O compilador não inspeciona nem valida o tipo desse valor; a
+responsabilidade de usar o registrador e preservar a convenção de chamada é
+do bloco assembly.
+
+`asm_return` pertence à seção `.text`. Usá-lo em `asm_data`, `asm_rodata` ou
+`asm_bss` é inválido, porque essas seções não podem retornar de uma função.
+
+O assembly precisa ser válido para NASM, e é responsabilidade do usuário
+respeitar registradores, pilha e a convenção de chamada. O reconhecimento
+termina na primeira `}` encontrada; chaves aninhadas não são suportadas pelo
+tokenizador dos blocos.
+
+## Inclusões com `include.bon`
+
+Para cada arquivo-fonte compilado, o compilador procura um arquivo chamado
+`include.bon` no mesmo diretório do arquivo principal. Esse arquivo contém uma
+diretiva por linha:
+
+```text
+include <stdlib/println.bon>
+include <stdlib/readfile.bon>
+```
+
+O conteúdo é unificado nesta ordem:
+
+```text
+1. stdlib/println.bon
+2. stdlib/readfile.bon
+3. arquivo .bon passado na linha de comando
+```
+
+Os caminhos são resolvidos relativamente ao diretório do arquivo principal,
+não ao diretório atual do shell. Portanto, esta estrutura funciona:
+
+```text
+projeto/
+├── include.bon
+├── app.bon
+└── stdlib/
+	├── println.bon
+	└── readfile.bon
+```
+
+`projeto/include.bon`:
+
+```text
+include <stdlib/println.bon>
+include <stdlib/readfile.bon>
+```
+
+`projeto/app.bon`:
+
+```bonobo
+let message = "ready";
+println(message);
+```
+
+As linhas vazias de `include.bon` são permitidas. Qualquer linha não vazia que
+não siga exatamente o formato `include <caminho>` causa erro antes do lexer.
+Se um arquivo listado não existir, a compilação também falha com o caminho do
+arquivo ausente.
+
+Os arquivos incluídos são lidos como texto e concatenados antes da tokenização.
+O conteúdo de um arquivo incluído não dispara uma nova busca por `include.bon`;
+as inclusões são controladas exclusivamente pelo `include.bon` ao lado do
+arquivo principal. O caminho pode usar subdiretórios, por exemplo
+`include <lib/math/basic.bon>`.
+
+Como a concatenação ocorre antes do parser, funções declaradas em arquivos
+incluídos ficam disponíveis para chamadas no arquivo principal:
+
+`stdlib/math.bon`:
+
+```bonobo
+def square(value) {
+	return value * value;
+}
+```
+
+`include.bon`:
+
+```text
+include <stdlib/math.bon>
+```
+
+`app.bon`:
+
+```bonobo
+let result = square(9);
+```
+
+## Estrutura de um programa completo
+
+O exemplo abaixo reúne declarações, função, condição, laço, operadores e
+assembly embutido:
+
+```bonobo
+# Função disponível para o restante do arquivo.
+def accumulate(limit) {
+	let total = 0;
+
+	for (let index = 0; index < limit; index = index + 1) {
+		total = total + index;
+	}
+
+	if (total > 10) {
+		return total;
+	} else {
+		return 0;
+	}
+}
+
+let result = accumulate(5);
+
+asm {
+	; O código é copiado para o assembly NASM.
+	nop
+}
+```
+
+## Modelo de compilação
+
+O parser cria um nó `Program` contendo funções e instruções de nível superior.
+O gerador então:
+
+1. registra as funções declaradas;
+2. gera cada função com prólogo e epílogo usando `rbp`;
+3. coloca instruções fora de funções em `func_main`;
+4. cria as seções `.data` para strings e `.bss` para variáveis globais;
+5. gera `_start`, que chama `func_main` e usa seu resultado como código de
+   saída do processo.
+
+Isso significa que o nível superior é executável, enquanto uma declaração
+`def` apenas registra uma função até que ela seja chamada.
+
+## Erros comuns
+
+### Falta de ponto e vírgula
+
+Errado:
+
+```bonobo
+let value = 10
+```
+
+Correto:
+
+```bonobo
+let value = 10;
+```
+
+### Bloco sem parênteses ou chaves
+
+Errado:
+
+```bonobo
+if value > 0 {
+	result = 1;
+}
+```
+
+Correto:
+
+```bonobo
+if (value > 0) {
+	result = 1;
+}
+```
+
+### Função chamada antes de ser reconhecida
+
+O gerador registra todas as definições do programa antes de gerar os corpos,
+portanto a ordem textual das definições não impede uma chamada. Contudo, o
+nome ainda precisa corresponder a uma função definida, possivelmente por um
+arquivo incluído:
+
+```bonobo
+let value = missing_function();  # erro: função não definida
+```
+
+### Sintaxe de tipos não implementada
+
+Não há declarações de tipo nativas como `int`, `string` ou `bool`. A forma
+`let tipo(nome) = valor;` é apenas açúcar para uma chamada de função e depende
+de uma função com esse nome.
+
+## Referência rápida
+
+```text
+program      := (function_def | statement)*
+function_def := def IDENT (param (',' param)*)? block
+param        := IDENT | '...'
+block        := '{' statement* '}'
+
+statement    := let_stmt
+			  | if_stmt
+			  | while_stmt
+			  | for_stmt
+			  | return_stmt
+			  | asm_stmt
+			  | block
+			  | expr_stmt
+
+let_stmt     := 'let' IDENT '=' expr ';'
+			  | 'let' IDENT '(' IDENT ')' '=' expr ';'
+if_stmt      := 'if' '(' expr ')' block ('else' block)?
+while_stmt   := 'while' '(' expr ')' block
+for_stmt     := 'for' '(' (let_stmt | expr_stmt | ';') expr? ';' expr? ')' block
+return_stmt  := 'return' expr? ';'
+asm_stmt     := ASM_BLOCK ';'?
+expr_stmt    := expr ';'
+
+expr         := assignment
+assignment   := equality ('=' assignment)?
+call         := primary ('(' arguments? ')')*
+primary      := NUMBER | STRING | IDENT | '(' expr ')'
+```
+
+Para a lista completa de operadores e sua precedência, consulte a seção
+[Expressões e operadores](#expressões-e-operadores).
