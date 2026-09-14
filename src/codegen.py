@@ -41,22 +41,47 @@ class LLVMCodeGenerator:
         self.symbol_table: Dict[str, ir.AllocaInstr] = {}
         self.symbol_types: Dict[str, ir.Type] = {}
         self.type_map: Dict[str, ir.Type] = {
+            # iN is also resolved dynamically below for arbitrary widths.
             "bool": ir.IntType(1),
+            "_Bool": ir.IntType(1),
+            "i1": ir.IntType(1),
             "char": ir.IntType(8),
+            "i8": ir.IntType(8),
             "short": ir.IntType(16),
+            "i16": ir.IntType(16),
             "int": ir.IntType(32),
             "signed": ir.IntType(32),
             "unsigned": ir.IntType(32),
+            "i32": ir.IntType(32),
             "long": ir.IntType(64),
+            "i64": ir.IntType(64),
+            "i128": ir.IntType(128),
+            "half": self._optional_llvm_type("HalfType"),
+            "bfloat": self._optional_llvm_type("BFloatType"),
             "float": ir.FloatType(),
             "double": ir.DoubleType(),
+            "fp128": self._optional_llvm_type("FP128Type"),
+            "x86_fp80": self._optional_llvm_type("X86_FP80Type"),
+            "ppc_fp128": self._optional_llvm_type("PPC_FP128Type"),
+            "x86_mmx": self._optional_llvm_type("MMXType"),
+            "x86_amx": self._optional_llvm_type("AMXType"),
+            "label": self._optional_llvm_type("LabelType"),
+            "metadata": self._optional_llvm_type("MetaDataType"),
+            "token": self._optional_llvm_type("TokenType"),
             "void": ir.VoidType(),
         }
+        self.type_map = {name: value for name, value in self.type_map.items() if value is not None}
         self.ptr_type = ir.PointerType()
+        self.type_map["ptr"] = self.ptr_type
         self.type_map["string"] = self.ptr_type
         self.type_map["str"] = self.ptr_type
         self.struct_types: Dict[str, ir.IdentifiedStructType] = {}
         self.string_constants: Dict[str, ir.GlobalVariable] = {}
+
+    @staticmethod
+    def _optional_llvm_type(type_name: str) -> Optional[ir.Type]:
+        type_class = getattr(ir, type_name, None)
+        return type_class() if type_class is not None else None
 
     def _get_llvm_type(self, type_str: Optional[str]) -> ir.Type:
         if not type_str:
@@ -65,7 +90,40 @@ class LLVMCodeGenerator:
             return self.type_map[type_str]
         if type_str in self.struct_types:
             return self.struct_types[type_str]
+        if type_str.endswith("*"):
+            return ir.PointerType()
+        integer_match = re.fullmatch(r"i([1-9][0-9]*)", type_str)
+        if integer_match:
+            return ir.IntType(int(integer_match.group(1)))
+        array_match = re.fullmatch(r"\[\s*([1-9][0-9]*)\s+x\s+(.+)\s*\]", type_str)
+        if array_match:
+            return ir.ArrayType(self._get_llvm_type(array_match.group(2)), int(array_match.group(1)))
+        vector_match = re.fullmatch(r"<\s*([1-9][0-9]*)\s+x\s+(.+)\s*>", type_str)
+        if vector_match:
+            return ir.VectorType(self._get_llvm_type(vector_match.group(2)), int(vector_match.group(1)))
+        if type_str.startswith("{") and type_str.endswith("}"):
+            fields = self._split_type_list(type_str[1:-1])
+            return ir.LiteralStructType([self._get_llvm_type(field) for field in fields])
         raise CodeGenError(f"Unknown type: {type_str}")
+
+    @staticmethod
+    def _split_type_list(type_list: str) -> List[str]:
+        """Split aggregate members without splitting nested LLVM types."""
+        parts = []
+        start = 0
+        depth = 0
+        for index, character in enumerate(type_list):
+            if character in "[{<":
+                depth += 1
+            elif character in "]}>":
+                depth -= 1
+            elif character == "," and depth == 0:
+                parts.append(type_list[start:index].strip())
+                start = index + 1
+        final_part = type_list[start:].strip()
+        if final_part:
+            parts.append(final_part)
+        return parts
 
     @staticmethod
     def _decode_string_literal(value: str) -> str:
@@ -75,35 +133,139 @@ class LLVMCodeGenerator:
         return value
 
     def _is_float(self, value_type: ir.Type) -> bool:
-        return isinstance(value_type, (ir.FloatType, ir.DoubleType))
+        float_classes = [
+            getattr(ir, type_name, None)
+            for type_name in (
+                "HalfType", "BFloatType", "FloatType", "DoubleType",
+                "FP128Type", "X86_FP80Type", "PPC_FP128Type",
+            )
+        ]
+        return isinstance(value_type, tuple(type_class for type_class in float_classes if type_class))
 
     def _is_integer(self, value_type: ir.Type) -> bool:
         return isinstance(value_type, ir.IntType)
+
+    @staticmethod
+    def _is_pointer(value_type: ir.Type) -> bool:
+        return isinstance(value_type, ir.PointerType)
+
+    @staticmethod
+    def _is_vector(value_type: ir.Type) -> bool:
+        return isinstance(value_type, ir.VectorType)
 
     def _zero(self, value_type: ir.Type) -> ir.Constant:
         if isinstance(value_type, ir.PointerType):
             return ir.Constant(value_type, None)
         return ir.Constant(value_type, 0.0 if self._is_float(value_type) else 0)
 
-    def _coerce(self, value: ir.Value, target_type: ir.Type) -> ir.Value:
+    # LLVM integer types are signless, so signedness is selected by the
+    # conversion helper rather than encoded in the type map.
+    conversion_map = {
+        ("integer", "integer"): ("trunc", "zext", "sext"),
+        ("integer", "float"): ("uitofp", "sitofp", "bitcast"),
+        ("float", "integer"): ("fptoui", "fptosi", "bitcast"),
+        ("float", "float"): ("fptrunc", "fpext"),
+        ("integer", "pointer"): ("inttoptr",),
+        ("pointer", "integer"): ("ptrtoint",),
+        ("pointer", "pointer"): ("bitcast", "addrspacecast"),
+    }
+
+    def _type_category(self, value_type: ir.Type) -> Optional[str]:
+        if self._is_integer(value_type):
+            return "integer"
+        if self._is_float(value_type):
+            return "float"
+        if self._is_pointer(value_type):
+            return "pointer"
+        if self._is_vector(value_type):
+            element_type = value_type.element
+            if self._is_integer(element_type):
+                return "integer"
+            if self._is_float(element_type):
+                return "float"
+        return None
+
+    @staticmethod
+    def _float_rank(value_type: ir.Type) -> int:
+        type_name = str(value_type)
+        return {"half": 16, "bfloat": 16, "float": 32, "double": 64,
+                "x86_fp80": 80, "fp128": 128, "ppc_fp128": 128}.get(type_name, 0)
+
+    def _coerce(self, value: ir.Value, target_type: ir.Type, signed: bool = True) -> ir.Value:
+        """Apply a legal LLVM conversion between first-class value types."""
         source_type = value.type
         if source_type == target_type:
             return value
-        if self._is_integer(source_type) and self._is_integer(target_type):
-            if source_type.width < target_type.width:
-                return self.builder.sext(value, target_type)
-            if source_type.width > target_type.width:
+
+        source_category = self._type_category(source_type)
+        target_category = self._type_category(target_type)
+        if source_category is None or target_category is None:
+            raise CodeGenError(f"Cannot convert {source_type} to {target_type}")
+
+        source_is_vector = self._is_vector(source_type)
+        target_is_vector = self._is_vector(target_type)
+        if source_is_vector != target_is_vector:
+            raise CodeGenError(f"Cannot convert {source_type} to {target_type}")
+        if source_is_vector and source_type.count != target_type.count:
+            raise CodeGenError(f"Cannot convert vectors with different lengths: {source_type} to {target_type}")
+
+        source_scalar = source_type.element if source_is_vector else source_type
+        target_scalar = target_type.element if target_is_vector else target_type
+
+        if source_category == "integer" and target_category == "integer":
+            if source_scalar.width < target_scalar.width:
+                return self.builder.sext(value, target_type) if signed else self.builder.zext(value, target_type)
+            if source_scalar.width > target_scalar.width:
                 return self.builder.trunc(value, target_type)
-            return value
-        if self._is_integer(source_type) and self._is_float(target_type):
-            return self.builder.sitofp(value, target_type)
-        if self._is_float(source_type) and self._is_integer(target_type):
-            return self.builder.fptosi(value, target_type)
-        if isinstance(source_type, ir.FloatType) and isinstance(target_type, ir.DoubleType):
-            return self.builder.fpext(value, target_type)
-        if isinstance(source_type, ir.DoubleType) and isinstance(target_type, ir.FloatType):
+            return self.builder.bitcast(value, target_type)
+
+        if source_category == "integer" and target_category == "float":
+            return (self.builder.sitofp if signed else self.builder.uitofp)(value, target_type)
+        if source_category == "float" and target_category == "integer":
+            return (self.builder.fptosi if signed else self.builder.fptoui)(value, target_type)
+        if source_category == "float" and target_category == "float":
+            if self._float_rank(source_scalar) < self._float_rank(target_scalar):
+                return self.builder.fpext(value, target_type)
             return self.builder.fptrunc(value, target_type)
+
+        if source_category == "integer" and target_category == "pointer":
+            return self.builder.inttoptr(value, target_type)
+        if source_category == "pointer" and target_category == "integer":
+            return self.builder.ptrtoint(value, target_type)
+        if source_category == "pointer" and target_category == "pointer":
+            source_address_space = getattr(source_type, "addrspace", 0)
+            target_address_space = getattr(target_type, "addrspace", 0)
+            if source_address_space != target_address_space:
+                return self.builder.addrspacecast(value, target_type)
+            return self.builder.bitcast(value, target_type)
+
         raise CodeGenError(f"Cannot convert {source_type} to {target_type}")
+
+    def _coerce_unsigned(self, value: ir.Value, target_type: ir.Type) -> ir.Value:
+        """Unsigned counterpart for integer/floating conversions."""
+        return self._coerce(value, target_type, signed=False)
+
+    def _bitcast(self, value: ir.Value, target_type: ir.Type) -> ir.Value:
+        """Reinterpret equal-width scalar or vector bits without conversion."""
+        source_type = value.type
+        source_scalar = source_type.element if self._is_vector(source_type) else source_type
+        target_scalar = target_type.element if self._is_vector(target_type) else target_type
+        if self._is_vector(source_type) != self._is_vector(target_type):
+            raise CodeGenError(f"Cannot bitcast {source_type} to {target_type}")
+        if self._is_vector(source_type) and source_type.count != target_type.count:
+            raise CodeGenError(f"Cannot bitcast vectors with different lengths: {source_type} to {target_type}")
+        source_bits = self._type_bit_width(source_scalar)
+        target_bits = self._type_bit_width(target_scalar)
+        if source_bits is None or target_bits is None or source_bits != target_bits:
+            raise CodeGenError(f"Cannot bitcast different-width types: {source_type} to {target_type}")
+        return self.builder.bitcast(value, target_type)
+
+    def _type_bit_width(self, value_type: ir.Type) -> Optional[int]:
+        if self._is_integer(value_type):
+            return value_type.width
+        if self._is_float(value_type):
+            return self._float_rank(value_type)
+        return None
 
     def _as_bool(self, value: ir.Value) -> ir.Value:
         if value.type == ir.IntType(1):

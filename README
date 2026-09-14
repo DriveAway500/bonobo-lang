@@ -1,650 +1,291 @@
 # Bonobo
 
-Bonobo é uma linguagem pequena, compilada para LLVM IR em ambientes Linux.
-O compilador implementa um pipeline direto:
+Bonobo is a small language that generates LLVM IR using Python and `llvmlite`.
 
-```text
-arquivo .bon
-	-> expansão de include.bon
-	-> lexer
-	-> parser recursivo descendente
-	-> AST
-	-> gerador de LLVM IR
-	-> Clang (opcional)
-```
+This README focuses on the compiler's two low-level features:
 
-Este documento descreve a sintaxe que o código atual aceita, apresenta um
-tutorial curto e registra as limitações conhecidas da implementação.
+- inline assembly blocks;
+- LLVM types and conversions between types.
 
-## Estado do projeto
+## Requirements and usage
 
-A linguagem já possui suporte sintático para:
-
-- variáveis locais e globais;
-- atribuições;
-- números inteiros e strings;
-- expressões aritméticas, relacionais e bit a bit;
-- funções com parâmetros;
-- chamadas de funções;
-- `if`/`else`, `while` e `for`;
-- `return`;
-- blocos de assembly inline LLVM;
-- arquivos de inclusão por meio de `include.bon`.
-
-O backend gera LLVM IR para a arquitetura alvo do Clang. O programa gerado
-define `func_main` e um ponto de entrada `_start`.
-
-## Requisitos
-
-Para gerar somente o LLVM IR, é necessário Python 3 e `llvmlite`. Para
-compilar um executável, também é necessário:
-
-- Clang;
-- Linux x86-64.
-
-O compilador usa apenas módulos da biblioteca padrão do Python.
-
-## Como executar
-
-O ponto de entrada é `src/main.py`. Como os imports são escritos para os
-módulos dentro de `src`, execute-o a partir da raiz do projeto desta forma:
+Use the project's virtual environment, since it contains the compatible
+version of `llvmlite`:
 
 ```bash
-PYTHONPATH=src python src/main.py caminho/para/programa.bon
+source .venv/bin/activate
+PYTHONPATH=src python src/main.py program.bon
 ```
 
-Esse comando gera `caminho/para/programa.asm`.
-
-Para também montar e linkar:
+To generate and compile an executable with Clang:
 
 ```bash
-PYTHONPATH=src python src/main.py caminho/para/programa.bon --compile
+PYTHONPATH=src python src/main.py program.bon --compile
 ```
 
-O executável será criado no mesmo caminho-base do arquivo `.bon` e o arquivo
-objeto intermediário será removido após o link. O caminho do arquivo-fonte é
-obrigatório. A opção `-c` é um alias de `--compile`.
-
-## Primeiro programa
-
-Crie `hello.bon`:
+The compiler accepts functions in the form
+`fn name(param: type) -> type { ... }`. The keyword `def` is also accepted
+as a synonym for `fn` — both are valid ways to declare a function:
 
 ```bonobo
-def main() {
-	return 0;
+fn add(a: i32, b: i32) -> i32 {
+    return a + b;
+}
+
+def add(a: i32, b: i32) -> i32 {
+    return a + b;
 }
 ```
 
-Gere LLVM IR:
-
-```bash
-PYTHONPATH=src python src/main.py hello.bon
-```
-
-O nome da função `main` não é obrigatório para a entrada do programa. Todo
-código escrito fora de uma função é colocado automaticamente em uma função
-sintética chamada `func_main`. A função `main` acima é uma função comum; para
-que o código global seja executado, basta escrever:
+A function without an explicit return type uses `void` and omits the `->`
+clause entirely:
 
 ```bonobo
-let result = 40 + 2;
+fn print(msg: string, len: int) {
+    // no "-> type" here: this function returns void
+}
 ```
 
-Nesse caso, o valor final retornado por `func_main` é `0`, pois o gerador
-encerra o corpo sintético com `xor rax, rax`.
+Line comments start with `//` and run to the end of the line.
 
-## Comentários e espaço em branco
+## Inline assembly
 
-Comentários de uma linha começam com `#` e vão até o fim da linha:
+Inline assembly follows the same constraint idea as LLVM/GCC. The block has
+a `template`, output operands, input operands and clobbers. The keyword may
+be written as `asm` or `asm volatile`, and the parenthesis may or may not be
+preceded by a space — both are valid:
 
 ```bonobo
-# Esta linha inteira é ignorada.
-let answer = 42;  # comentários também podem aparecer depois de código
+asm volatile(
+    template: "add $1, $0",
+    outputs: ["=r"(result)],
+    inputs: ["r"(value)],
+    clobbers: ["~{cc}"]
+);
 ```
 
-Espaços, tabulações e quebras de linha são ignorados pelo lexer, exceto por
-separarem tokens. Não existe sintaxe de comentário de bloco.
-
-## Identificadores e palavras reservadas
-
-Um identificador começa com uma letra ASCII ou `_` e pode continuar com
-letras, dígitos e `_`:
+Each operand has the form:
 
 ```text
-válido:   value, _temporary, item2, calcula_total
-inválido:  2items, nome-com-hifen
+"constraint"(expression)
 ```
 
-Os identificadores são sensíveis a maiúsculas e minúsculas. As palavras
-reservadas não podem ser usadas como identificadores porque são reconhecidas
-antes do token genérico `IDENT`:
+Lists may be empty. `volatile` is optional:
+
+```bonobo
+asm(
+    template: "nop",
+    outputs: [],
+    inputs: [],
+    clobbers: []
+);
+```
+
+Constraint strings are forwarded as-is to LLVM, so besides generic
+constraints like `r` you can also pin an operand to a specific hardware
+register by naming it in braces, e.g. `"{rax}"`, `"{rdi}"`, `"={rax}"`:
+
+```bonobo
+asm volatile(
+    template: "syscall",
+    outputs: ["={rax}"(n)],
+    inputs: [
+        "{rax}"(0),
+        "{rdi}"(0),
+        "{rsi}"(buf),
+        "{rdx}"(1)
+    ],
+    clobbers: ["~{rcx}", "~{r11}", "~{memory}"]
+);
+```
+
+### Output operands
+
+An output must use an existing variable and a constraint that starts with
+`=` (optionally naming a specific register, e.g. `={rax}`). The backend
+passes the variable's slot as the result of the inline operation and writes
+the returned value back into that slot:
+
+```bonobo
+fn increment(value: i32) -> i32 {
+    let result: i32 = value;
+    asm volatile(
+        template: "addl $1, $0",
+        outputs: ["=r"(result)],
+        inputs: ["0"(value)],
+        clobbers: ["~{cc}"]
+    );
+    return result;
+}
+```
+
+When there are multiple outputs, LLVM returns a `struct` literal from the
+assembly and the backend extracts each field in the declared order:
+
+```bonobo
+asm(
+    template: "",
+    outputs: ["=r"(low), "=r"(high)],
+    inputs: [],
+    clobbers: []
+);
+```
+
+The variables `low` and `high` must be declared before the block, and their
+types determine the LLVM types of the results.
+
+### Input operands
+
+For an input, the expression is evaluated and its LLVM-typed value is used
+directly. Three kinds of expressions are accepted:
+
+- an existing variable, loaded from its typed slot;
+- an integer literal constant, used as-is;
+- an address-of expression `&variable`, which yields a pointer to the
+  variable's slot instead of its value.
+
+```bonobo
+let number: i64 = 42;
+let buf: int = 0;
+
+asm volatile(
+    template: "syscall",
+    outputs: [],
+    inputs: [
+        "{rax}"(0),      // syscall number, as a literal constant
+        "{rdi}"(0),      // fd
+        "{rsi}"(&buf),   // address of the variable, via &
+        "{rdx}"(1)
+    ],
+    clobbers: ["~{rcx}", "~{r11}", "~{memory}"]
+);
+```
+
+The template and constraints are forwarded to `llvmlite.ir.InlineAsm`;
+therefore register names and constraints must be valid for the target
+architecture's LLVM/Clang backend.
+
+### Clobbers and caveats
+
+Clobbers are LLVM strings, e.g. `"~{rax}"`, `"~{rcx}"`, `"~{r11}"`,
+`"~{memory}"` or `"~{cc}"`. The compiler does not validate whether the
+template semantically matches the declared registers.
+
+- Declare every register, flag or memory state altered by the assembly.
+- Use `asm volatile` when the instruction cannot be removed or reordered.
+- The assembly must not return `void` while declaring outputs.
+- The current string syntax has no escapes; a quote character ends the
+  string.
+
+## LLVM types
+
+The backend maps these names directly to `llvmlite.ir`:
+
+| Bonobo/LLVM | LLVM type |
+| --- | --- |
+| `bool`, `_Bool`, `i1` | 1-bit integer |
+| `char`, `i8` | 8-bit integer |
+| `short`, `i16` | 16-bit integer |
+| `int`, `signed`, `unsigned`, `i32` | 32-bit integer |
+| `long`, `i64` | 64-bit integer |
+| `i128`, `iN` | arbitrary-width integer |
+| `half` | 16-bit floating point |
+| `float` | 32-bit floating point |
+| `double` | 64-bit floating point |
+| `fp128`, `x86_fp80`, `ppc_fp128` | extended LLVM float formats, when exposed by `llvmlite` |
+| `ptr`, `string`, `str` | opaque pointer |
+| `label`, `metadata`, `token` | special LLVM types, when exposed by `llvmlite` |
+
+The backend also recognizes composite types in LLVM notation:
 
 ```text
-let  if  else  while  for  def  return  asm
+[4 x i8]             ; array
+<4 x i32>            ; vector
+{i32, double}        ; struct literal
+i8*                  ; legacy pointer, converted to an opaque pointer
 ```
 
-## Tipos de literal
+In the current grammar, composite types using `[]`, `<>` or `{}` cannot yet
+be written directly in declarations, because those characters belong to
+other parser rules. They can already be resolved by the backend and are
+intended for use by future grammar extensions.
 
-### Números
+## Type conversion
 
-O lexer aceita números inteiros decimais formados por um ou mais dígitos:
+Conversions are inserted automatically whenever an expression is used in a
+typed declaration, assignment, function argument, or return statement:
 
 ```bonobo
-let zero = 0;
-let count = 12345;
-let negative = -10;
+let small: i8 = 7;
+let wide: i64 = small;
+let decimal: double = wide;
+let again: i32 = decimal;
 ```
 
-O sinal não faz parte do literal: `-10` é uma operação unária aplicada ao
-número `10`. Literais hexadecimais, binários, números decimais com ponto e
-separadores numéricos não fazem parte da sintaxe atual.
+The backend picks the LLVM instruction according to the source and
+destination types:
 
-### Strings
-
-Strings são delimitadas por aspas duplas:
-
-```bonobo
-let message = "hello, bonobo";
-```
-
-O conteúdo é armazenado no LLVM IR como uma sequência terminada em zero e
-produz um ponteiro para essa sequência. O lexer atual não implementa escapes
-como `\\n`, `\\"` ou `\\\\`; uma string termina na próxima aspa dupla.
-
-## Declarações e atribuições
-
-### Declaração simples
-
-Uma variável é declarada com `let`, um identificador, `=` e uma expressão,
-sempre terminada por `;`:
-
-```bonobo
-let first = 10;
-let second = first + 32;
-let text = "Bonobo";
-```
-
-No nível do arquivo, as variáveis são emitidas na seção `.bss`. Dentro de uma
-função, elas são armazenadas em slots relativos a `rbp`.
-
-### Declaração com conversor
-
-Existe uma forma abreviada para chamar uma função sobre o valor inicial:
-
-```bonobo
-let string(message) = 42;
-```
-
-Ela é interpretada como:
-
-```bonobo
-let message = string(42);
-```
-
-O primeiro identificador (`string` no exemplo) não é um tipo nativo. Ele é o
-nome de uma função que precisa estar definida no programa ou em um arquivo
-incluído.
-
-### Atribuição
-
-Uma atribuição usa um identificador à esquerda e uma expressão à direita:
-
-```bonobo
-let total = 1;
-total = total + 1;
-total = total * 10;
-```
-
-A atribuição é associativa à direita, portanto a forma `a = b = 3` é aceita
-pela gramática. O alvo precisa ser um identificador; expressões como
-`(a + b) = 1` são rejeitadas.
-
-## Funções
-
-Uma função possui `def`, nome, lista opcional de parâmetros e um bloco:
-
-```bonobo
-def add(left, right) {
-	return left + right;
-}
-
-let result = add(20, 22);
-```
-
-Cada função vira uma função `func_<nome>` no LLVM IR. Os seis primeiros
-parâmetros são recebidos nos registradores da convenção System V:
-
-```text
-1: rdi   2: rsi   3: rdx   4: rcx   5: r8   6: r9
-```
-
-Parâmetros posicionais são copiados para slots locais no prólogo da função.
-
-Uma função pode não ter parâmetros:
-
-```bonobo
-def answer() {
-	return 42;
-}
-
-let result = answer();
-```
-
-O parser também aceita `...` como parâmetro variádico:
-
-```bonobo
-def log(...) {
-	return 0;
-}
-```
-
-Na implementação atual, esse parâmetro é reconhecido pela sintaxe, mas não é
-materializado como uma coleção acessível no corpo da função. Argumentos além
-dos seis primeiros são empilhados pelo gerador de chamadas, sem uma API de
-acesso específica no código da função.
-
-### Chamadas
-
-Uma chamada é formada por um identificador seguido de parênteses:
-
-```bonobo
-let value = add(1, 2);
-print(value);
-```
-
-Somente identificadores podem ser chamados. Assim, `(factory)()` e
-`get_factory()()` não são aceitos pela gramática. O gerador exige que o nome
-chamado corresponda a uma função registrada no programa; chamar um nome não
-definido produz erro de geração de código.
-
-## Controle de fluxo
-
-Condições usam expressões inteiras. O valor zero é tratado como falso e
-qualquer valor diferente de zero como verdadeiro.
-
-### `if` e `else`
-
-```bonobo
-if (score >= 60) {
-	result = 1;
-} else {
-	result = 0;
-}
-```
-
-Os parênteses da condição e as chaves dos blocos são obrigatórios.
-A sintaxe de `else if` não existe; encadeie um `if` dentro do bloco `else`:
-
-```bonobo
-if (value < 0) {
-	result = -1;
-} else {
-	if (value == 0) {
-		result = 0;
-	} else {
-		result = 1;
-	}
-}
-```
-
-### `while`
-
-```bonobo
-let counter = 0;
-while (counter < 10) {
-	counter = counter + 1;
-}
-```
-
-O corpo do `while` é sempre um bloco entre `{` e `}`. Não há `break` nem
-`continue` na gramática atual.
-
-### `for`
-
-A forma geral é:
-
-```text
-for (inicialização; condição; atualização) { ... }
-```
-
-Exemplo com declaração:
-
-```bonobo
-for (let i = 0; i < 5; i = i + 1) {
-	total = total + i;
-}
-```
-
-A inicialização pode ser uma declaração `let`, uma expressão ou vazia. A
-condição e a atualização também podem ser omitidas:
-
-```bonobo
-for (; total < 10; ) {
-	total = total + 1;
-}
-```
-
-O parser aceita `for (;;)` como laço sem condição. Como não existe `break`, um
-laço assim só termina por outra lógica externa, como um `return` dentro de uma
-função.
-
-## `return`
-
-`return` aceita uma expressão opcional e exige `;`:
-
-```bonobo
-def with_value() {
-	return 7 * 6;
-}
-
-def without_value() {
-	return;
-}
-```
-
-Sem expressão, o gerador coloca zero em `rax`. Com expressão, o resultado é
-deixado em `rax` antes do retorno.
-
-## Expressões e operadores
-
-A gramática implementa a seguinte precedência, da maior para a menor:
-
-| Nível | Operadores | Associatividade |
+| Source | Destination | LLVM instruction |
 | --- | --- | --- |
-| 1 | chamada `f(...)`, literais, identificadores, `(expr)` | pós-fixada |
-| 2 | `+expr`, `-expr`, `~expr` | direita |
-| 3 | `*`, `/` | esquerda |
-| 4 | `+`, `-` | esquerda |
-| 5 | `<<`, `>>` | esquerda |
-| 6 | `&` | esquerda |
-| 7 | `^` | esquerda |
-| 8 | `\|` | esquerda |
-| 9 | `<`, `>`, `<=`, `>=` | esquerda |
-| 10 | `==`, `!=` | esquerda |
-| 11 | `=` | direita |
+| smaller integer | larger signed integer | `sext` |
+| smaller integer | larger unsigned integer | `zext` |
+| larger integer | smaller integer | `trunc` |
+| integer | signed floating point | `sitofp` |
+| integer | unsigned floating point | `uitofp` |
+| floating point | signed integer | `fptosi` |
+| floating point | unsigned integer | `fptoui` |
+| smaller float | larger float | `fpext` |
+| larger float | smaller float | `fptrunc` |
+| integer | pointer | `inttoptr` |
+| pointer | integer | `ptrtoint` |
+| pointer, same address space | pointer | `bitcast` |
+| pointer, different address spaces | pointer | `addrspacecast` |
 
-Exemplo que usa a precedência:
+LLVM integers have no intrinsic signedness: `i32` does not say whether a
+value is signed or unsigned. Because of that, the choice between
+`sext`/`zext`, `sitofp`/`uitofp` and `fptosi`/`fptoui` has to come from the
+compiler's context. The internal `_coerce_unsigned` API is available for
+code paths that explicitly know a value is unsigned.
 
-```bonobo
-let value = 2 + 3 * 4;       # 14
-let shifted = value << 1;    # deslocamento à esquerda
-let check = shifted >= 20;
-let bits = (value & 15) ^ 2;
-```
-
-### Operadores aritméticos
-
-São aceitos:
-
-```text
-+   soma
--   subtração
-*    multiplicação
-/    divisão inteira com sinal
-```
-
-O operador `/` usa `idiv`. Divisão por zero é um erro em tempo de execução do
-processador, não uma verificação feita pelo parser.
-
-### Operadores relacionais
-
-```text
-==   igual
-!=   diferente
-<    menor
->    maior
-<=   menor ou igual
->=   maior ou igual
-```
-
-O resultado de uma comparação é normalizado pelo LLVM IR para `0` ou `1`.
-
-### Operadores bit a bit
-
-```text
-&    AND
-|    OR
-^    XOR
-~    complemento bit a bit
-<<   deslocamento à esquerda
->>   deslocamento à direita
-```
-
-### Atribuição dentro de expressões
-
-Como `=` está no nível de expressão, ela pode aparecer onde uma expressão é
-esperada:
+Pointers convert to and from integers the same way as any other value used
+in a typed declaration:
 
 ```bonobo
-let a = 0;
-let b = 0;
-a = b = 5;
+let p: ptr = c;      // i64 -> ptr, inttoptr
+let addr: i64 = p;   // ptr -> i64, ptrtoint
 ```
 
-Apesar de ser sintaticamente válida, prefira atribuições isoladas para manter
-o código legível.
+### Reinterpretation with `bitcast`
 
-## Assembly inline
+`bitcast` does not convert the value numerically; it just reinterprets the
+same bits as another type of the same width. The backend offers `_bitcast`
+to validate this rule before emitting the instruction:
 
-A linguagem possui apenas um bloco de assembly: `asm { ... }`. O conteúdo é
-emitido como LLVM inline asm dentro da função atual. As formas antigas
-`asm_text`, `asm_return`, `asm_data`, `asm_rodata` e `asm_bss` não são aceitas.
-
-```bonobo
-asm {
-	nop
-};
+```llvm
+%as_float = bitcast i32 %value to float
 ```
 
-O ponto e vírgula depois do bloco é opcional. O código precisa usar a sintaxe
-de assembly aceita pelo LLVM/Clang e respeitar a convenção de chamada do alvo.
-O reconhecimento termina na primeira `}`; chaves aninhadas não são suportadas
-pelo tokenizador dos blocos.
+This is different from:
 
-## Inclusões com `include.bon`
-
-Para cada arquivo-fonte compilado, o compilador procura um arquivo chamado
-`include.bon` no mesmo diretório do arquivo principal. Esse arquivo contém uma
-diretiva por linha:
-
-```text
-include <stdlib/println.bon>
-include <stdlib/readfile.bon>
+```llvm
+%as_float = sitofp i32 %value to float
 ```
 
-O conteúdo é unificado nesta ordem:
+In the first case, the bits are preserved. In the second, the integer
+number is converted to a floating-point value.
 
-```text
-1. stdlib/println.bon
-2. stdlib/readfile.bon
-3. arquivo .bon passado na linha de comando
+Conversions between types that have no corresponding LLVM instruction are
+rejected with `CodeGenError`; the compiler does not silently convert
+structs, arrays, `void`, `metadata`, `token` or `label`.
+
+## Generated IR example
+
+For a conversion from `i32` to `i64` and then to `double`, the expected
+result includes instructions similar to:
+
+```llvm
+%wide = sext i32 %small to i64
+%decimal = sitofp i64 %wide to double
 ```
 
-Os caminhos são resolvidos relativamente ao diretório do arquivo principal,
-não ao diretório atual do shell. Portanto, esta estrutura funciona:
-
-```text
-projeto/
-├── include.bon
-├── app.bon
-└── stdlib/
-	├── println.bon
-	└── readfile.bon
-```
-
-`projeto/include.bon`:
-
-```text
-include <stdlib/println.bon>
-include <stdlib/readfile.bon>
-```
-
-`projeto/app.bon`:
-
-```bonobo
-let message = "ready";
-println(message);
-```
-
-As linhas vazias de `include.bon` são permitidas. Qualquer linha não vazia que
-não siga exatamente o formato `include <caminho>` causa erro antes do lexer.
-Se um arquivo listado não existir, a compilação também falha com o caminho do
-arquivo ausente.
-
-Os arquivos incluídos são lidos como texto e concatenados antes da tokenização.
-O conteúdo de um arquivo incluído não dispara uma nova busca por `include.bon`;
-as inclusões são controladas exclusivamente pelo `include.bon` ao lado do
-arquivo principal. O caminho pode usar subdiretórios, por exemplo
-`include <lib/math/basic.bon>`.
-
-Como a concatenação ocorre antes do parser, funções declaradas em arquivos
-incluídos ficam disponíveis para chamadas no arquivo principal:
-
-`stdlib/math.bon`:
-
-```bonobo
-def square(value) {
-	return value * value;
-}
-```
-
-`include.bon`:
-
-```text
-include <stdlib/math.bon>
-```
-
-`app.bon`:
-
-```bonobo
-let result = square(9);
-```
-
-## Estrutura de um programa completo
-
-O exemplo abaixo reúne declarações, função, condição, laço, operadores e
-assembly embutido:
-
-```bonobo
-# Função disponível para o restante do arquivo.
-def accumulate(limit) {
-	let total = 0;
-
-	for (let index = 0; index < limit; index = index + 1) {
-		total = total + index;
-	}
-
-	if (total > 10) {
-		return total;
-	} else {
-		return 0;
-	}
-}
-
-let result = accumulate(5);
-
-asm {
-	nop
-}
-```
-
-## Modelo de compilação
-
-O parser cria um nó `Program` contendo funções e instruções de nível superior.
-O gerador então:
-
-1. registra as funções declaradas;
-2. gera cada função com prólogo e epílogo LLVM;
-3. coloca instruções fora de funções em `func_main`;
-4. cria as seções `.data` para strings e `.bss` para variáveis globais;
-5. gera `_start`, que chama `func_main` e usa seu resultado como código de
-   saída do processo.
-
-Isso significa que o nível superior é executável, enquanto uma declaração
-`def` apenas registra uma função até que ela seja chamada.
-
-## Erros comuns
-
-### Falta de ponto e vírgula
-
-Errado:
-
-```bonobo
-let value = 10
-```
-
-Correto:
-
-```bonobo
-let value = 10;
-```
-
-### Bloco sem parênteses ou chaves
-
-Errado:
-
-```bonobo
-if value > 0 {
-	result = 1;
-}
-```
-
-Correto:
-
-```bonobo
-if (value > 0) {
-	result = 1;
-}
-```
-
-### Função chamada antes de ser reconhecida
-
-O gerador registra todas as definições do programa antes de gerar os corpos,
-portanto a ordem textual das definições não impede uma chamada. Contudo, o
-nome ainda precisa corresponder a uma função definida, possivelmente por um
-arquivo incluído:
-
-```bonobo
-let value = missing_function();  # erro: função não definida
-```
-
-### Sintaxe de tipos não implementada
-
-Não há declarações de tipo nativas como `int`, `string` ou `bool`. A forma
-`let tipo(nome) = valor;` é apenas açúcar para uma chamada de função e depende
-de uma função com esse nome.
-
-## Referência rápida
-
-```text
-program      := (function_def | statement)*
-function_def := def IDENT (param (',' param)*)? block
-param        := IDENT | '...'
-block        := '{' statement* '}'
-
-statement    := let_stmt
-			  | if_stmt
-			  | while_stmt
-			  | for_stmt
-			  | return_stmt
-			  | asm_stmt
-			  | block
-			  | expr_stmt
-
-let_stmt     := 'let' IDENT '=' expr ';'
-			  | 'let' IDENT '(' IDENT ')' '=' expr ';'
-if_stmt      := 'if' '(' expr ')' block ('else' block)?
-while_stmt   := 'while' '(' expr ')' block
-for_stmt     := 'for' '(' (let_stmt | expr_stmt | ';') expr? ';' expr? ')' block
-return_stmt  := 'return' expr? ';'
-asm_stmt     := ASM_BLOCK ';'?
-expr_stmt    := expr ';'
-
-expr         := assignment
-assignment   := equality ('=' assignment)?
-call         := primary ('(' arguments? ')')*
-primary      := NUMBER | STRING | IDENT | '(' expr ')'
-```
-
-Para a lista completa de operadores e sua precedência, consulte a seção
-[Expressões e operadores](#expressões-e-operadores).
+The final IR can be inspected by running the compiler without `--compile`.
