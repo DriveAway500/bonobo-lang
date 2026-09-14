@@ -1,334 +1,389 @@
-"""
-parser.py — Analisador sintático (recursive-descent) da linguagem "Bonobo".
+import ply.yacc as yacc
 
-Gramática (informal):
-
-    program      := (function_def | statement)*
-
-    function_def := DEF IDENT LPAREN param_list? RPAREN block
-    param_list   := param (COMMA param)*
-    param        := IDENT | ELLIPSIS
-
-    block        := LBRACE statement* RBRACE
-
-    statement    := let_stmt | if_stmt | while_stmt | for_stmt
-                  | return_stmt | asm_stmt | block | expr_stmt
-
-    let_stmt     := LET IDENT ASSIGN expr SEMI
-                  | LET IDENT LPAREN IDENT RPAREN ASSIGN expr SEMI
-                    # segunda forma: `let str(message) = "...";`
-                    # açúcar para  `let message = str("...");`
-
-    if_stmt      := IF LPAREN expr RPAREN block (ELSE block)?
-    while_stmt   := WHILE LPAREN expr RPAREN block
-    for_stmt     := FOR LPAREN (let_stmt | expr_stmt | SEMI)
-                         expr? SEMI expr? RPAREN block
-    return_stmt  := RETURN expr? SEMI
-    asm_stmt     := ASM_BLOCK SEMI?
-                  | ASM_RETURN_BLOCK SEMI?
-    expr_stmt    := expr SEMI
-
-    expr         := assignment
-    assignment   := equality (ASSIGN assignment)?
-    equality     := relational ((EQ | NEQ) relational)*
-    relational   := bit_or ((LT|GT|LE|GE) bit_or)*
-    bit_or       := bit_xor (BIT_OR bit_xor)*
-    bit_xor      := bit_and (BIT_XOR bit_and)*
-    bit_and      := shift (BIT_AND shift)*
-    shift        := additive ((SHL|SHR) additive)*
-    additive     := multiplicative ((PLUS|MINUS) multiplicative)*
-    multiplicative := unary ((MUL|DIV) unary)*
-    unary        := (PLUS|MINUS|BIT_NOT) unary | call
-    call         := primary (LPAREN arg_list? RPAREN)*
-    primary      := NUMBER | STRING | IDENT | LPAREN expr RPAREN
-"""
-
-from typing import List, Optional
-
-from utils import nodes as ast
-from lexer import Token, tokenize
+# Import token list and lexer definition from your lexer
+from lexer import lexer, tokens, reserved
 
 
-class ParseError(Exception):
-    def __init__(self, message: str, token: Token):
-        super().__init__(
-            f"{message} (encontrado {token.type} {token.value!r} na linha {token.line}, coluna {token.col})"
-        )
-        self.token = token
+# --- AST Node Definitions ---
+
+class ASTNode:
+    """Base class for all Abstract Syntax Tree nodes."""
+    pass
+
+class ProgramNode(ASTNode):
+    def __init__(self, statements):
+        self.statements = statements
+
+class FunctionDeclNode(ASTNode):
+    def __init__(self, name, params, return_type, body):
+        self.name = name
+        self.params = params
+        self.return_type = return_type
+        self.body = body
+
+class VarDeclNode(ASTNode):
+    def __init__(self, is_mutable, name, var_type, value):
+        self.is_mutable = is_mutable
+        self.name = name
+        self.type = var_type
+        self.value = value
+
+class StructDeclNode(ASTNode):
+    def __init__(self, name, fields):
+        self.name = name
+        self.fields = fields
+
+class BlockNode(ASTNode):
+    def __init__(self, statements):
+        self.statements = statements
+
+class IfNode(ASTNode):
+    def __init__(self, condition, then_branch, else_branch):
+        self.condition = condition
+        self.then_branch = then_branch
+        self.else_branch = else_branch
+
+class WhileNode(ASTNode):
+    def __init__(self, condition, body):
+        self.condition = condition
+        self.body = body
+
+class ReturnNode(ASTNode):
+    def __init__(self, expression):
+        self.expression = expression
+
+# --- New Assembly AST Nodes ---
+
+class AsmOperandNode(ASTNode):
+    def __init__(self, constraint, expression):
+        self.constraint = constraint    # Ex: "={rax}"
+        self.expression = expression    # AST Node para a variável/valor
+
+class AsmBlockNode(ASTNode):
+    def __init__(self, is_volatile, template, outputs, inputs, clobbers):
+        self.is_volatile = is_volatile  # True/False
+        self.template = template        # String com a instrução ex: "syscall"
+        self.outputs = outputs          # Lista de AsmOperandNode
+        self.inputs = inputs            # Lista de AsmOperandNode
+        self.clobbers = clobbers        # Lista de strings ex: ["~{rcx}", "~{r11}"]
+
+# ------------------------------
+
+class BinaryOpNode(ASTNode):
+    def __init__(self, left, op, right):
+        self.left = left
+        self.op = op
+        self.right = right
+
+class UnaryOpNode(ASTNode):
+    def __init__(self, op, operand):
+        self.op = op
+        self.operand = operand
+
+class LiteralNode(ASTNode):
+    def __init__(self, value, literal_type):
+        self.value = value
+        self.type = literal_type
+
+class IdentifierNode(ASTNode):
+    def __init__(self, name):
+        self.name = name
+
+class FnCallNode(ASTNode):
+    def __init__(self, name, args):
+        self.name = name
+        self.args = args
 
 
-class Parser:
-    def __init__(self, tokens: List[Token]):
-        self.tokens = tokens
-        self.pos = 0
+# --- Operator Precedence and Associativity ---
 
-    # ---- utilidades de navegação -----------------------------------
-    def peek(self, offset: int = 0) -> Token:
-        idx = min(self.pos + offset, len(self.tokens) - 1)
-        return self.tokens[idx]
-
-    def advance(self) -> Token:
-        tok = self.tokens[self.pos]
-        if tok.type != 'EOF':
-            self.pos += 1
-        return tok
-
-    def check(self, *types: str) -> bool:
-        return self.peek().type in types
-
-    def match(self, *types: str) -> Optional[Token]:
-        if self.check(*types):
-            return self.advance()
-        return None
-
-    def expect(self, type_: str, message: Optional[str] = None) -> Token:
-        if self.check(type_):
-            return self.advance()
-        raise ParseError(message or f"Esperado token {type_}", self.peek())
-
-    # ---- ponto de entrada --------------------------------------------
-    def parse_program(self) -> ast.Program:
-        body = []
-        while not self.check('EOF'):
-            body.append(self.parse_top_level())
-        return ast.Program(body)
-
-    def parse_top_level(self) -> ast.Node:
-        if self.check('DEF'):
-            return self.parse_function_def()
-        return self.parse_statement()
-
-    # ---- funções -------------------------------------------------------
-    def parse_function_def(self) -> ast.FunctionDef:
-        self.expect('DEF')
-        name = self.expect('IDENT').value
-        self.expect('LPAREN')
-        params = []
-        if not self.check('RPAREN'):
-            params.append(self.parse_param())
-            while self.match('COMMA'):
-                params.append(self.parse_param())
-        self.expect('RPAREN')
-        body = self.parse_block()
-        return ast.FunctionDef(name, params, body)
-
-    def parse_param(self) -> ast.Param:
-        if self.match('ELLIPSIS'):
-            return ast.Param(name='...', variadic=True)
-        name = self.expect('IDENT').value
-        return ast.Param(name)
-
-    def parse_block(self) -> ast.Block:
-        self.expect('LBRACE')
-        statements = []
-        while not self.check('RBRACE'):
-            statements.append(self.parse_statement())
-        self.expect('RBRACE')
-        return ast.Block(statements)
-
-    # ---- statements ------------------------------------------------------
-    def parse_statement(self) -> ast.Node:
-        if self.check('LET'):
-            return self.parse_let()
-        if self.check('IF'):
-            return self.parse_if()
-        if self.check('WHILE'):
-            return self.parse_while()
-        if self.check('FOR'):
-            return self.parse_for()
-        if self.check('RETURN'):
-            return self.parse_return()
-        if self.check(
-            'ASM_BLOCK',
-            'ASM_RETURN_BLOCK',
-            'ASM_TEXT_BLOCK',
-            'ASM_DATA_BLOCK',
-            'ASM_RODATA_BLOCK',
-            'ASM_BSS_BLOCK',
-        ):
-            return self.parse_asm()
-        if self.check('LBRACE'):
-            return self.parse_block()
-        return self.parse_expr_statement()
-
-    def parse_let(self) -> ast.LetStmt:
-        self.expect('LET')
-        first = self.expect('IDENT').value
-        caster = None
-        name = first
-        if self.match('LPAREN'):
-            # açúcar: `let TIPO(NOME) = EXPR;` -> name=NOME, caster=TIPO
-            caster = first
-            name = self.expect('IDENT').value
-            self.expect('RPAREN')
-        self.expect('ASSIGN')
-        value = self.parse_expr()
-        self.expect('SEMI')
-        return ast.LetStmt(name=name, caster=caster, value=value)
-
-    def parse_if(self) -> ast.IfStmt:
-        self.expect('IF')
-        self.expect('LPAREN')
-        condition = self.parse_expr()
-        self.expect('RPAREN')
-        then_block = self.parse_block()
-        else_block = None
-        if self.match('ELSE'):
-            else_block = self.parse_block()
-        return ast.IfStmt(condition, then_block, else_block)
-
-    def parse_while(self) -> ast.WhileStmt:
-        self.expect('WHILE')
-        self.expect('LPAREN')
-        condition = self.parse_expr()
-        self.expect('RPAREN')
-        body = self.parse_block()
-        return ast.WhileStmt(condition, body)
-
-    def parse_for(self) -> ast.ForStmt:
-        self.expect('FOR')
-        self.expect('LPAREN')
-
-        init = None
-        if self.check('LET'):
-            init = self.parse_let()          # já consome o SEMI
-        elif not self.check('SEMI'):
-            init = ast.ExprStmt(self.parse_expr())
-            self.expect('SEMI')
-        else:
-            self.expect('SEMI')
-
-        condition = None
-        if not self.check('SEMI'):
-            condition = self.parse_expr()
-        self.expect('SEMI')
-
-        update = None
-        if not self.check('RPAREN'):
-            update = self.parse_expr()
-        self.expect('RPAREN')
-
-        body = self.parse_block()
-        return ast.ForStmt(init, condition, update, body)
-
-    def parse_return(self) -> ast.ReturnStmt:
-        self.expect('RETURN')
-        value = None
-        if not self.check('SEMI'):
-            value = self.parse_expr()
-        self.expect('SEMI')
-        return ast.ReturnStmt(value)
-
-    def parse_asm(self) -> ast.AsmStmt:
-        tok = self.advance()
-        raw = tok.value
-        start = raw.index('{') + 1
-        end = raw.rindex('}')
-        code = raw[start:end].strip('\n')
-        self.match('SEMI')  # ponto e vírgula opcional depois do bloco
-        section = {
-            'ASM_BLOCK': 'text',
-            'ASM_RETURN_BLOCK': 'text',
-            'ASM_TEXT_BLOCK': 'text',
-            'ASM_DATA_BLOCK': 'data',
-            'ASM_RODATA_BLOCK': 'rodata',
-            'ASM_BSS_BLOCK': 'bss',
-        }[tok.type]
-        return ast.AsmStmt(code, section, returns=tok.type == 'ASM_RETURN_BLOCK')
-
-    def parse_expr_statement(self) -> ast.ExprStmt:
-        expr = self.parse_expr()
-        self.expect('SEMI')
-        return ast.ExprStmt(expr)
-
-    # ---- expressões (precedence climbing) ---------------------------------
-    def parse_expr(self) -> ast.Node:
-        return self.parse_assignment()
-
-    def parse_assignment(self) -> ast.Node:
-        expr = self.parse_equality()
-        if self.check('ASSIGN'):
-            if not isinstance(expr, ast.Ident):
-                raise ParseError("Alvo de atribuição inválido", self.peek())
-            self.advance()
-            value = self.parse_assignment()
-            return ast.Assign(expr.name, value)
-        return expr
-
-    def _binop_level(self, next_level, *op_types: str) -> ast.Node:
-        expr = next_level()
-        while self.check(*op_types):
-            op = self.advance().type
-            right = next_level()
-            expr = ast.BinOp(op, expr, right)
-        return expr
-
-    def parse_equality(self) -> ast.Node:
-        return self._binop_level(self.parse_relational, 'EQ', 'NEQ')
-
-    def parse_relational(self) -> ast.Node:
-        return self._binop_level(self.parse_bit_or, 'LT', 'GT', 'LE', 'GE')
-
-    def parse_bit_or(self) -> ast.Node:
-        return self._binop_level(self.parse_bit_xor, 'BIT_OR')
-
-    def parse_bit_xor(self) -> ast.Node:
-        return self._binop_level(self.parse_bit_and, 'BIT_XOR')
-
-    def parse_bit_and(self) -> ast.Node:
-        return self._binop_level(self.parse_shift, 'BIT_AND')
-
-    def parse_shift(self) -> ast.Node:
-        return self._binop_level(self.parse_additive, 'SHL', 'SHR')
-
-    def parse_additive(self) -> ast.Node:
-        return self._binop_level(self.parse_multiplicative, 'PLUS', 'MINUS')
-
-    def parse_multiplicative(self) -> ast.Node:
-        return self._binop_level(self.parse_unary, 'MUL', 'DIV')
-
-    def parse_unary(self) -> ast.Node:
-        if self.check('PLUS', 'MINUS', 'BIT_NOT'):
-            op = self.advance().type
-            operand = self.parse_unary()
-            return ast.UnaryOp(op, operand)
-        return self.parse_call()
-
-    def parse_call(self) -> ast.Node:
-        expr = self.parse_primary()
-        while self.check('LPAREN'):
-            self.advance()
-            args = []
-            if not self.check('RPAREN'):
-                args.append(self.parse_expr())
-                while self.match('COMMA'):
-                    args.append(self.parse_expr())
-            self.expect('RPAREN')
-            if not isinstance(expr, ast.Ident):
-                raise ParseError("Somente identificadores podem ser chamados", self.peek())
-            expr = ast.Call(expr.name, args)
-        return expr
-
-    def parse_primary(self) -> ast.Node:
-        tok = self.peek()
-        if tok.type == 'NUMBER':
-            self.advance()
-            return ast.Number(int(tok.value))
-        if tok.type == 'STRING':
-            self.advance()
-            return ast.String(tok.value[1:-1])
-        if tok.type == 'IDENT':
-            self.advance()
-            return ast.Ident(tok.value)
-        if tok.type == 'LPAREN':
-            self.advance()
-            expr = self.parse_expr()
-            self.expect('RPAREN')
-            return expr
-        raise ParseError("Expressão esperada", tok)
+precedence = (
+    ('right', 'ASSIGN', 'ADD_ASSIGN', 'SUB_ASSIGN', 'MUL_ASSIGN', 'DIV_ASSIGN'),
+    ('left', 'LOGICAL_OR'),
+    ('left', 'LOGICAL_AND'),
+    ('left', 'BIT_OR'),
+    ('left', 'BIT_XOR'),
+    ('left', 'BIT_AND'),
+    ('left', 'EQ', 'NEQ'),
+    ('left', 'LT', 'LE', 'GT', 'GE'),
+    ('left', 'SHL', 'SHR'),
+    ('left', 'PLUS', 'MINUS'),
+    ('left', 'MUL', 'DIV', 'MOD'),
+    ('right', 'UNARY', 'LOGICAL_NOT', 'BIT_NOT'),
+    ('left', 'DOT', 'ARROW'),
+)
 
 
-def parse(source: str) -> ast.Program:
-    """Atalho: tokeniza e faz o parse do código-fonte, retornando o Program."""
-    tokens = tokenize(source)
-    return Parser(tokens).parse_program()
+# --- Grammar Rules ---
+
+def p_program(p):
+    '''program : statement_list'''
+    p[0] = ProgramNode(p[1])
+
+def p_statement_list(p):
+    '''statement_list : statement_list statement
+                      | empty'''
+    if len(p) == 3:
+        p[0] = p[1] + [p[2]]
+    else:
+        p[0] = []
+
+def p_statement(p):
+    '''statement : function_decl
+                 | var_decl SEMI
+                 | struct_decl
+                 | if_statement
+                 | while_statement
+                 | return_statement SEMI
+                 | asm_statement SEMI
+                 | expr_statement SEMI
+                 | block'''
+    p[0] = p[1]
+
+# Rust-like syntax: fn name(param: type) -> ReturnType { ... }
+def p_function_decl(p):
+    '''function_decl : DEF IDENT '(' parameter_list ')' ARROW type block
+                     | DEF IDENT '(' parameter_list ')' block'''
+    if len(p) == 9:
+        p[0] = FunctionDeclNode(p[2], p[4], p[7], p[8])
+    else:
+        p[0] = FunctionDeclNode(p[2], p[4], "void", p[6])
+
+def p_parameter_list(p):
+    '''parameter_list : parameter_list_nonempty
+                      | empty'''
+    p[0] = p[1] if p[1] is not None else []
+
+def p_parameter_list_nonempty(p):
+    '''parameter_list_nonempty : parameter_list_nonempty COMMA parameter
+                               | parameter'''
+    if len(p) == 4:
+        p[0] = p[1] + [p[3]]
+    else:
+        p[0] = [p[1]]
+
+def p_parameter(p):
+    '''parameter : IDENT COLON type'''
+    p[0] = (p[1], p[3])
+
+# Rust-like variable declarations: let mut x: int = 10; or let x = 10;
+def p_var_decl(p):
+    '''var_decl : LET IDENT COLON type ASSIGN expression
+                | LET IDENT ASSIGN expression
+                | LET IDENT COLON type'''
+    if len(p) == 7:
+        p[0] = VarDeclNode(is_mutable=False, name=p[2], var_type=p[4], value=p[6])
+    elif len(p) == 5 and p[3] == '=':
+        p[0] = VarDeclNode(is_mutable=False, name=p[2], var_type=None, value=p[4])
+    else:
+        p[0] = VarDeclNode(is_mutable=False, name=p[2], var_type=p[4], value=None)
+
+# Struct declarations: struct Point { x: int, y: int }
+def p_struct_decl(p):
+    '''struct_decl : KEYWORD_STRUCT IDENT '{' struct_field_list '}' '''
+    p[0] = StructDeclNode(p[2], p[4])
+
+def p_struct_field_list(p):
+    '''struct_field_list : struct_field_list COMMA struct_field
+                         | struct_field
+                         | empty'''
+    if len(p) == 4:
+        p[0] = p[1] + [p[3]]
+    elif len(p) == 2 and p[1] is not None:
+        p[0] = [p[1]]
+    else:
+        p[0] = []
+
+def p_struct_field(p):
+    '''struct_field : IDENT COLON type'''
+    p[0] = (p[1], p[3])
+
+# Control Flow
+def p_if_statement(p):
+    '''if_statement : IF expression block ELSE block
+                    | IF expression block'''
+    if len(p) == 6:
+        p[0] = IfNode(p[2], p[3], p[5])
+    else:
+        p[0] = IfNode(p[2], p[3], None)
+
+def p_while_statement(p):
+    '''while_statement : WHILE expression block'''
+    p[0] = WhileNode(p[2], p[3])
+
+def p_return_statement(p):
+    '''return_statement : RETURN expression
+                         | RETURN'''
+    p[0] = ReturnNode(p[2] if len(p) == 3 else None)
+
+
+# --- Inline Assembly Parsing Rules ---
+
+def p_asm_statement(p):
+    '''asm_statement : KEYWORD_ASM KEYWORD_VOLATILE '(' asm_field_list ')'
+                     | KEYWORD_ASM '(' asm_field_list ')' '''
+    if len(p) == 6:
+        fields = p[4]
+        is_volatile = True
+    else:
+        fields = p[3]
+        is_volatile = False
+
+    p[0] = AsmBlockNode(
+        is_volatile=is_volatile,
+        template=fields.get('template', ""),
+        outputs=fields.get('outputs', []),
+        inputs=fields.get('inputs', []),
+        clobbers=fields.get('clobbers', [])
+    )
+
+def p_asm_field_list(p):
+    '''asm_field_list : asm_field_list COMMA asm_field
+                      | asm_field'''
+    if len(p) == 4:
+        p[1].update(p[3])
+        p[0] = p[1]
+    else:
+        p[0] = p[1]
+
+def p_asm_field(p):
+    '''asm_field : KEYWORD_TEMPLATE COLON STRING
+                 | KEYWORD_OUTPUTS COLON '[' asm_operand_list ']'
+                 | KEYWORD_INPUTS COLON '[' asm_operand_list ']'
+                 | KEYWORD_CLOBBERS COLON '[' string_list ']' '''
+    key = p[1]
+    if key == 'template':
+        p[0] = {'template': p[3]}
+    elif key == 'outputs':
+        p[0] = {'outputs': p[4]}
+    elif key == 'inputs':
+        p[0] = {'inputs': p[4]}
+    elif key == 'clobbers':
+        p[0] = {'clobbers': p[4]}
+
+def p_asm_operand_list(p):
+    '''asm_operand_list : asm_operand_list COMMA asm_operand
+                         | asm_operand
+                         | empty'''
+    if len(p) == 4:
+        p[0] = p[1] + [p[3]]
+    elif len(p) == 2 and p[1] is not None:
+        p[0] = [p[1]]
+    else:
+        p[0] = []
+
+def p_asm_operand(p):
+    '''asm_operand : STRING '(' expression ')' '''
+    p[0] = AsmOperandNode(constraint=p[1], expression=p[3])
+
+def p_string_list(p):
+    '''string_list : string_list COMMA STRING
+                   | STRING
+                   | empty'''
+    if len(p) == 4:
+        p[0] = p[1] + [p[3]]
+    elif len(p) == 2 and p[1] is not None:
+        p[0] = [p[1]]
+    else:
+        p[0] = []
+
+# -------------------------------------
+
+
+def p_block(p):
+    '''block : '{' statement_list '}' '''
+    p[0] = BlockNode(p[2])
+
+def p_expr_statement(p):
+    '''expr_statement : expression'''
+    p[0] = p[1]
+
+# Types
+def p_type(p):
+    '''type : TYPE_INT
+            | TYPE_CHAR
+            | TYPE_FLOAT
+            | TYPE_DOUBLE
+            | TYPE_VOID
+            | TYPE_BOOL
+            | TYPE_SHORT
+            | TYPE_LONG
+            | TYPE_SIGNED
+            | TYPE_UNSIGNED
+            | IDENT'''
+    p[0] = p[1]
+
+# Expressions
+def p_expression_binop(p):
+    '''expression : expression PLUS expression
+                  | expression MINUS expression
+                  | expression MUL expression
+                  | expression DIV expression
+                  | expression MOD expression
+                  | expression EQ expression
+                  | expression NEQ expression
+                  | expression LT expression
+                  | expression LE expression
+                  | expression GT expression
+                  | expression GE expression
+                  | expression LOGICAL_AND expression
+                  | expression LOGICAL_OR expression
+                  | expression BIT_AND expression
+                  | expression BIT_OR expression
+                  | expression BIT_XOR expression
+                  | expression SHL expression
+                  | expression SHR expression
+                  | expression ASSIGN expression'''
+    p[0] = BinaryOpNode(p[1], p[2], p[3])
+
+def p_expression_unary(p):
+    '''expression : MINUS expression %prec UNARY
+                  | LOGICAL_NOT expression
+                  | BIT_NOT expression
+                  | BIT_AND expression %prec UNARY'''
+    p[0] = UnaryOpNode(p[1], p[2])
+
+def p_expression_group(p):
+    '''expression : '(' expression ')' '''
+    p[0] = p[2]
+
+def p_expression_literal(p):
+    '''expression : NUMBER
+                  | FLOAT_NUMBER
+                  | HEX_NUMBER
+                  | STRING'''
+    p[0] = LiteralNode(p[1], "literal")
+
+def p_expression_identifier(p):
+    '''expression : IDENT'''
+    p[0] = IdentifierNode(p[1])
+
+def p_expression_call(p):
+    '''expression : IDENT '(' arg_list ')' '''
+    p[0] = FnCallNode(p[1], p[3])
+
+def p_arg_list(p):
+    '''arg_list : arg_list_nonempty
+                | empty'''
+    p[0] = p[1] if p[1] is not None else []
+
+def p_arg_list_nonempty(p):
+    '''arg_list_nonempty : arg_list_nonempty COMMA expression
+                         | expression'''
+    if len(p) == 4:
+        p[0] = p[1] + [p[3]]
+    else:
+        p[0] = [p[1]]
+
+def p_empty(p):
+    '''empty :'''
+    pass
+
+def p_error(p):
+    if p:
+        print(f"Syntax error at token '{p.value}' (line {p.lineno})")
+    else:
+        print("Syntax error at EOF")
+
+# Build the parser
+parser = yacc.yacc()

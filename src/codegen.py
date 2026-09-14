@@ -1,345 +1,425 @@
 """
-codegen.py — Percorre a AST (nodes.py) e produz assembly NASM
-(x86-64, Linux, System V calling convention), usando os trechos
-definidos em templates.py.
-
-Estratégia geral:
-  - Cada `def nome(...) { ... }` vira o label `func_nome`.
-  - Instruções soltas no nível do módulo (fora de qualquer `def`) são
-    agrupadas dentro de uma função sintética `func_main`, chamada por
-    `_start`.
-  - Variáveis locais (parâmetros e `let` dentro de função) vivem na pilha,
-    referenciadas via [rbp-offset].
-  - Variáveis globais (`let` no nível do módulo) vivem em .bss.
-  - Literais de string são deduplicados e colocados em .data.
-  - Blocos `asm { ... }` são emitidos verbatim (o usuário assume controle
-    total do que acontece ali).
+codegen.py — Traverses the AST from parser.py and generates LLVM IR using modern llvmlite.
 """
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+import llvmlite.ir as ir
+import re
 
-from utils import nodes as ast
-from utils import templates as tmpl
+# Importing AST nodes directly from parser.py
+from parser import (
+    AsmBlockNode,
+    AsmOperandNode,
+    BinaryOpNode,
+    BlockNode,
+    FnCallNode,
+    FunctionDeclNode,
+    IdentifierNode,
+    IfNode,
+    LiteralNode,
+    ProgramNode,
+    ReturnNode,
+    StructDeclNode,
+    UnaryOpNode,
+    VarDeclNode,
+    WhileNode,
+)
 
 
 class CodeGenError(Exception):
     pass
 
 
-class Scope:
-    """Tabela de símbolos de uma função: nome -> deslocamento (rbp-relativo)."""
+class LLVMCodeGenerator:
+    """AST visitor that generates modern LLVM IR (Opaque Pointers compliant)."""
 
-    def __init__(self):
-        self.offsets: Dict[str, int] = {}
-        self.next_offset = 8  # primeiro slot logo abaixo do rbp salvo
+    def __init__(self) -> None:
+        self.module = ir.Module(name="main_module")
+        self.builder: Optional[ir.IRBuilder] = None
+        self.current_fn: Optional[ir.Function] = None
 
-    def declare(self, name: str) -> int:
-        if name in self.offsets:
-            return self.offsets[name]
-        offset = self.next_offset
-        self.offsets[name] = offset
-        self.next_offset += 8
-        return offset
+        self.symbol_table: Dict[str, ir.AllocaInstr] = {}
+        self.symbol_types: Dict[str, ir.Type] = {}
+        self.type_map: Dict[str, ir.Type] = {
+            "bool": ir.IntType(1),
+            "char": ir.IntType(8),
+            "short": ir.IntType(16),
+            "int": ir.IntType(32),
+            "signed": ir.IntType(32),
+            "unsigned": ir.IntType(32),
+            "long": ir.IntType(64),
+            "float": ir.FloatType(),
+            "double": ir.DoubleType(),
+            "void": ir.VoidType(),
+        }
+        self.ptr_type = ir.PointerType()
+        self.type_map["string"] = self.ptr_type
+        self.type_map["str"] = self.ptr_type
+        self.struct_types: Dict[str, ir.IdentifiedStructType] = {}
+        self.string_constants: Dict[str, ir.GlobalVariable] = {}
 
-    def lookup(self, name: str) -> Optional[int]:
-        return self.offsets.get(name)
+    def _get_llvm_type(self, type_str: Optional[str]) -> ir.Type:
+        if not type_str:
+            return self.type_map["int"]
+        if type_str in self.type_map:
+            return self.type_map[type_str]
+        if type_str in self.struct_types:
+            return self.struct_types[type_str]
+        raise CodeGenError(f"Unknown type: {type_str}")
 
+    @staticmethod
+    def _decode_string_literal(value: str) -> str:
+        """Convert a lexer string token into the value expected by LLVM APIs."""
+        if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+            return bytes(value[1:-1], "utf-8").decode("unicode_escape")
+        return value
 
-class CodeGen:
-    def __init__(self):
-        self.data_lines: List[str] = []
-        self.rodata_lines: List[str] = []
-        self.bss_lines: List[str] = []
-        self.text_lines: List[str] = []
+    def _is_float(self, value_type: ir.Type) -> bool:
+        return isinstance(value_type, (ir.FloatType, ir.DoubleType))
 
-        self.globals: Dict[str, str] = {}        # nome -> label .bss
-        self.functions: Dict[str, ast.FunctionDef] = {}
-        self.string_pool: Dict[str, str] = {}     # conteúdo -> label .data
+    def _is_integer(self, value_type: ir.Type) -> bool:
+        return isinstance(value_type, ir.IntType)
 
-        self._label_count = 0
-        self.scope: Optional[Scope] = None
+    def _zero(self, value_type: ir.Type) -> ir.Constant:
+        if isinstance(value_type, ir.PointerType):
+            return ir.Constant(value_type, None)
+        return ir.Constant(value_type, 0.0 if self._is_float(value_type) else 0)
 
-    # ---- utilidades -----------------------------------------------------
-    def new_label(self, prefix: str = 'L') -> str:
-        self._label_count += 1
-        return f"{prefix}{self._label_count}"
+    def _coerce(self, value: ir.Value, target_type: ir.Type) -> ir.Value:
+        source_type = value.type
+        if source_type == target_type:
+            return value
+        if self._is_integer(source_type) and self._is_integer(target_type):
+            if source_type.width < target_type.width:
+                return self.builder.sext(value, target_type)
+            if source_type.width > target_type.width:
+                return self.builder.trunc(value, target_type)
+            return value
+        if self._is_integer(source_type) and self._is_float(target_type):
+            return self.builder.sitofp(value, target_type)
+        if self._is_float(source_type) and self._is_integer(target_type):
+            return self.builder.fptosi(value, target_type)
+        if isinstance(source_type, ir.FloatType) and isinstance(target_type, ir.DoubleType):
+            return self.builder.fpext(value, target_type)
+        if isinstance(source_type, ir.DoubleType) and isinstance(target_type, ir.FloatType):
+            return self.builder.fptrunc(value, target_type)
+        raise CodeGenError(f"Cannot convert {source_type} to {target_type}")
 
-    def emit(self, line: str = '') -> None:
-        self.text_lines.append(line)
+    def _as_bool(self, value: ir.Value) -> ir.Value:
+        if value.type == ir.IntType(1):
+            return value
+        if self._is_integer(value.type):
+            return self.builder.icmp_signed("!=", value, self._zero(value.type))
+        if self._is_float(value.type):
+            return self.builder.fcmp_ordered("!=", value, self._zero(value.type))
+        if isinstance(value.type, ir.PointerType):
+            return self.builder.icmp_unsigned("!=", value, self._zero(value.type))
+        raise CodeGenError(f"{value.type} cannot be used as a condition")
 
-    def string_label(self, value: str) -> str:
-        if value in self.string_pool:
-            return self.string_pool[value]
-        label = f"str_{len(self.string_pool)}"
-        self.string_pool[value] = label
-        self.data_lines.append(
-            tmpl.STRING_DATA.format(label=label, bytes=f'"{value}"')
-        )
-        return label
+    def generate(self, node) -> ir.Module:
+        """Main entry point to visit nodes."""
+        method_name = f"visit_{type(node).__name__}"
+        visitor = getattr(self, method_name, self.generic_visit)
+        return visitor(node)
 
-    def var_ref(self, name: str) -> str:
-        if self.scope is not None:
-            offset = self.scope.lookup(name)
-            if offset is not None:
-                return f"[rbp-{offset}]"
-        if name in self.globals:
-            return f"[{self.globals[name]}]"
-        raise CodeGenError(f"Variável não declarada: {name!r}")
+    def generic_visit(self, node):
+        raise CodeGenError(f"No visit_{type(node).__name__} method defined.")
 
-    def declare_target(self, name: str) -> str:
-        """Reserva armazenamento para `name` (local se dentro de função,
-        global/.bss caso contrário) e devolve o operando de memória."""
-        if self.scope is not None:
-            offset = self.scope.declare(name)
-            return f"[rbp-{offset}]"
-        label = f"var_{name}"
-        if name not in self.globals:
-            self.globals[name] = label
-            self.bss_lines.append(tmpl.GLOBAL_VAR_BSS.format(label=label))
-        return f"[{label}]"
+    # ---- AST Node Visitors --------------------------------------------------
 
-    # ---- ponto de entrada -------------------------------------------------
-    def generate(self, program: ast.Program) -> str:
-        # primeiro passo: registra assinaturas de todas as funções
-        for node in program.body:
-            if isinstance(node, ast.FunctionDef):
-                self.functions[node.name] = node
-
-        self.emit(tmpl.GLOBAL_START)
-        self.emit()
-        self.emit(tmpl.SECTION_TEXT_HEADER)
-        self.emit()
-
-        main_stmts: List[ast.Node] = []
-        for node in program.body:
-            if isinstance(node, ast.FunctionDef):
-                self.gen_function(node)
-                self.emit()
-            else:
-                main_stmts.append(node)
-
-        self.gen_synthetic_main(main_stmts)
-        self.emit()
-        self.emit(tmpl.START_ENTRY)
-
-        parts = [tmpl.HEADER]
-        if self.data_lines:
-            parts.append(tmpl.SECTION_DATA_HEADER)
-            parts.extend(self.data_lines)
-            parts.append('')
-        if self.rodata_lines:
-            parts.append(tmpl.SECTION_RODATA_HEADER)
-            parts.extend(self.rodata_lines)
-            parts.append('')
-        if self.bss_lines:
-            parts.append(tmpl.SECTION_BSS_HEADER)
-            parts.extend(self.bss_lines)
-            parts.append('')
-        parts.extend(self.text_lines)
-        return '\n'.join(parts) + '\n'
-
-    def gen_synthetic_main(self, statements: List[ast.Node]) -> None:
-        """Instruções soltas no módulo viram o corpo de `func_main`."""
-        self.emit(tmpl.FUNC_PROLOGUE.format(label='func_main'))
-        self.scope = Scope()
-        for stmt in statements:
-            self.gen_statement(stmt)
-        self.scope = None
-        if not self.statement_terminates(statements[-1] if statements else None):
-            self.emit('    xor rax, rax')
-            self.emit(tmpl.FUNC_EPILOGUE)
-
-    # ---- funções ------------------------------------------------------------
-    def gen_function(self, node: ast.FunctionDef) -> None:
-        label = f"func_{node.name}"
-        self.emit(tmpl.FUNC_PROLOGUE.format(label=label))
-        self.scope = Scope()
-
-        for i, param in enumerate(node.params):
-            if param.variadic:
-                continue
-            offset = self.scope.declare(param.name)
-            if i < len(tmpl.ARG_REGISTERS):
-                reg = tmpl.ARG_REGISTERS[i]
-                self.emit(tmpl.PARAM_SPILL.format(offset=offset, reg=reg, name=param.name))
-
-        for stmt in node.body.statements:
-            self.gen_statement(stmt)
-
-        self.scope = None
-        if not self.statement_terminates(
-            node.body.statements[-1] if node.body.statements else None
-        ):
-            self.emit(tmpl.FUNC_EPILOGUE)
-
-    def statement_terminates(self, node: Optional[ast.Node]) -> bool:
-        if isinstance(node, (ast.ReturnStmt, ast.AsmStmt)):
-            return isinstance(node, ast.ReturnStmt) or node.returns
-        if isinstance(node, ast.Block):
-            return self.statement_terminates(
-                node.statements[-1] if node.statements else None
-            )
-        if isinstance(node, ast.IfStmt) and node.else_block is not None:
-            return (
-                self.statement_terminates(node.then_block)
-                and self.statement_terminates(node.else_block)
-            )
-        return False
-
-    # ---- statements -----------------------------------------------------------
-    def gen_statement(self, node: ast.Node) -> None:
-        method = getattr(self, f"gen_{type(node).__name__}", None)
-        if method is None:
-            raise CodeGenError(f"Statement não suportado: {type(node).__name__}")
-        method(node)
-
-    def gen_LetStmt(self, node: ast.LetStmt) -> None:
-        value_expr = node.value
-        if node.caster:
-            # açúcar: `let TIPO(NOME) = EXPR;` -> avalia TIPO(EXPR)
-            value_expr = ast.Call(node.caster, [value_expr])
-        self.gen_expr(value_expr)
-        target = self.declare_target(node.name)
-        self.emit(f"    mov {target}, rax")
-
-    def gen_Assign(self, node: ast.Assign) -> None:
-        self.gen_expr(node.value)
-        target = self.declare_target(node.name)
-        self.emit(f"    mov {target}, rax")
-
-    def gen_ExprStmt(self, node: ast.ExprStmt) -> None:
-        self.gen_expr(node.expr)
-
-    def gen_Block(self, node: ast.Block) -> None:
+    def visit_ProgramNode(self, node: ProgramNode) -> ir.Module:
         for stmt in node.statements:
-            self.gen_statement(stmt)
+            if isinstance(stmt, StructDeclNode):
+                self.generate(stmt)
+        for stmt in node.statements:
+            if isinstance(stmt, FunctionDeclNode):
+                self._declare_function(stmt)
+        for stmt in node.statements:
+            if isinstance(stmt, FunctionDeclNode):
+                self._define_function(stmt)
+        return self.module
 
-    def gen_IfStmt(self, node: ast.IfStmt) -> None:
-        else_label = self.new_label('else')
-        end_label = self.new_label('endif')
+    def visit_StructDeclNode(self, node: StructDeclNode):
+        struct_type = self.module.context.get_identified_type(node.name)
+        self.struct_types[node.name] = struct_type
+        struct_type.set_body(*(self._get_llvm_type(field_type) for _, field_type in node.fields))
+        return struct_type
 
-        self.gen_expr(node.condition)
-        self.emit(tmpl.JUMP_IF_FALSE.format(label=else_label if node.else_block else end_label))
-        self.gen_statement(node.then_block)
+    def _declare_function(self, node: FunctionDeclNode) -> ir.Function:
+        param_types = [self._get_llvm_type(ptype) for _, ptype in node.params]
+        ret_type = self._get_llvm_type(node.return_type)
+        if node.name in self.module.globals:
+            return self.module.globals[node.name]
+        func = ir.Function(self.module, ir.FunctionType(ret_type, param_types), name=node.name)
+        for argument, (name, _) in zip(func.args, node.params):
+            argument.name = name
+        return func
 
-        if node.else_block:
-            self.emit(tmpl.JUMP.format(label=end_label))
-            self.emit(tmpl.LABEL.format(label=else_label))
-            self.gen_statement(node.else_block)
+    def _define_function(self, node: FunctionDeclNode) -> ir.Function:
+        func = self.module.globals[node.name]
+        entry_block = func.append_basic_block(name="entry")
+        self.builder = ir.IRBuilder(entry_block)
+        self.current_fn = func
+        self.symbol_table = {}
+        self.symbol_types = {}
 
-        self.emit(tmpl.LABEL.format(label=end_label))
+        for arg, (pname, ptype) in zip(func.args, node.params):
+            alloc_type = self._get_llvm_type(ptype)
+            alloca = self.builder.alloca(alloc_type, name=pname)
+            self.builder.store(arg, alloca)
+            self.symbol_table[pname] = alloca
+            self.symbol_types[pname] = alloc_type
 
-    def gen_WhileStmt(self, node: ast.WhileStmt) -> None:
-        start_label = self.new_label('while')
-        end_label = self.new_label('endwhile')
+        self.generate(node.body)
 
-        self.emit(tmpl.LABEL.format(label=start_label))
-        self.gen_expr(node.condition)
-        self.emit(tmpl.JUMP_IF_FALSE.format(label=end_label))
-        self.gen_statement(node.body)
-        self.emit(tmpl.JUMP.format(label=start_label))
-        self.emit(tmpl.LABEL.format(label=end_label))
-
-    def gen_ForStmt(self, node: ast.ForStmt) -> None:
-        if node.init:
-            self.gen_statement(node.init)
-
-        start_label = self.new_label('for')
-        end_label = self.new_label('endfor')
-
-        self.emit(tmpl.LABEL.format(label=start_label))
-        if node.condition:
-            self.gen_expr(node.condition)
-            self.emit(tmpl.JUMP_IF_FALSE.format(label=end_label))
-        self.gen_statement(node.body)
-        if node.update:
-            self.gen_expr(node.update)
-        self.emit(tmpl.JUMP.format(label=start_label))
-        self.emit(tmpl.LABEL.format(label=end_label))
-
-    def gen_ReturnStmt(self, node: ast.ReturnStmt) -> None:
-        if node.value is not None:
-            self.gen_expr(node.value)
-        else:
-            self.emit('    xor rax, rax')
-        self.emit(tmpl.FUNC_EPILOGUE)
-
-    def gen_AsmStmt(self, node: ast.AsmStmt) -> None:
-        if node.returns and node.section != 'text':
-            raise CodeGenError("asm_return só pode ser usado na seção .text")
-
-        if node.section == 'data':
-            target = self.data_lines
-        elif node.section == 'rodata':
-            target = self.rodata_lines
-        elif node.section == 'bss':
-            target = self.bss_lines
-        elif node.section == 'text':
-            target = self.text_lines
-        else:
-            raise CodeGenError(f"Seção assembly não suportada: {node.section!r}")
-
-        target.append(tmpl.INLINE_ASM_BEGIN)
-        for line in node.code.splitlines():
-            target.append(f"    {line.strip()}" if line.strip() else '')
-        target.append(tmpl.INLINE_ASM_END)
-        if node.returns:
-            target.append(tmpl.FUNC_EPILOGUE)
-
-    # ---- expressões ------------------------------------------------------------
-    def gen_expr(self, node: ast.Node) -> None:
-        method = getattr(self, f"gen_{type(node).__name__}", None)
-        if method is None:
-            raise CodeGenError(f"Expressão não suportada: {type(node).__name__}")
-        method(node)
-
-    def gen_Number(self, node: ast.Number) -> None:
-        self.emit(f"    mov rax, {node.value}")
-
-    def gen_String(self, node: ast.String) -> None:
-        label = self.string_label(node.value)
-        self.emit(f"    lea rax, [{label}]")
-
-    def gen_Ident(self, node: ast.Ident) -> None:
-        self.emit(f"    mov rax, {self.var_ref(node.name)}")
-
-    def gen_UnaryOp(self, node: ast.UnaryOp) -> None:
-        self.gen_expr(node.operand)
-        instr = tmpl.UNARY_OP_INSTR.get(node.op)
-        if instr is None:
-            raise CodeGenError(f"Operador unário não suportado: {node.op}")
-        self.emit(f"    {instr}")
-
-    def gen_BinOp(self, node: ast.BinOp) -> None:
-        self.gen_expr(node.left)
-        self.emit('    push rax')
-        self.gen_expr(node.right)
-        self.emit('    mov rbx, rax')
-        self.emit('    pop rax')
-
-        if node.op == 'DIV':
-            self.emit(tmpl.DIV_OP_INSTR)
-        elif node.op in tmpl.BIN_OP_INSTR:
-            self.emit(f"    {tmpl.BIN_OP_INSTR[node.op]}")
-        elif node.op in tmpl.COMPARISON_SETCC:
-            self.emit('    cmp rax, rbx')
-            self.emit('    xor rax, rax')
-            self.emit(f"    {tmpl.COMPARISON_SETCC[node.op]}")
-        else:
-            raise CodeGenError(f"Operador binário não suportado: {node.op}")
-
-    def gen_Call(self, node: ast.Call) -> None:
-        for i, arg in enumerate(node.args):
-            self.gen_expr(arg)
-            if i < len(tmpl.ARG_REGISTERS):
-                self.emit(f"    mov {tmpl.ARG_REGISTERS[i]}, rax")
+        if not self.builder.block.is_terminated:
+            if isinstance(func.function_type.return_type, ir.VoidType):
+                self.builder.ret_void()
             else:
-                self.emit('    push rax')  # args extras vão na pilha (7º+)
-        if node.callee not in self.functions:
-            raise CodeGenError(f"Função não definida: {node.callee!r}")
-        self.emit(f"    call func_{node.callee}")
+                self.builder.ret(self._zero(func.function_type.return_type))
 
+        self.current_fn = None
+        self.builder = None
+        return func
 
-def generate(program: ast.Program) -> str:
-    """Atalho: gera o assembly NASM completo a partir do Program."""
-    return CodeGen().generate(program)
+    def visit_BlockNode(self, node: BlockNode) -> None:
+        for stmt in node.statements:
+            if not self.builder.block.is_terminated:
+                self.generate(stmt)
+
+    def visit_VarDeclNode(self, node: VarDeclNode) -> ir.AllocaInstr:
+        value = self.generate(node.value) if node.value is not None else None
+        llvm_type = self._get_llvm_type(node.type) if node.type else (
+            value.type if value is not None else self.type_map["int"]
+        )
+        alloca = self.builder.alloca(llvm_type, name=node.name)
+
+        if value is not None:
+            self.builder.store(self._coerce(value, llvm_type), alloca)
+
+        self.symbol_table[node.name] = alloca
+        self.symbol_types[node.name] = llvm_type
+        return alloca
+
+    def visit_AsmOperandNode(self, node: AsmOperandNode) -> Tuple[str, ir.Value, Optional[str]]:
+        """Evaluates operand expression and returns constraint, value and target variable name."""
+        target_var = None
+        if isinstance(node.expression, IdentifierNode):
+            target_var = node.expression.name
+            if target_var not in self.symbol_table:
+                raise CodeGenError(f"Undefined variable in asm operand: {target_var}")
+            
+            # If constraint indicates output ('='), pass alloca directly or evaluate
+            if node.constraint.startswith("="):
+                val = self.symbol_table[target_var]
+            else:
+                ptr = self.symbol_table[target_var]
+                val = self.builder.load(ptr, typ=self.symbol_types[target_var], name=f"{target_var}_asm_in")
+        else:
+            val = self.generate(node.expression)
+
+        return node.constraint, val, target_var
+
+    def visit_AsmBlockNode(self, node: AsmBlockNode) -> Optional[ir.Instruction]:
+        asm_template = self._decode_string_literal(node.template)
+
+        # Process output operands
+        out_constraints = []
+        out_types = []
+        out_targets = []
+
+        for out_op in node.outputs:
+            constraint, val_ptr, target_name = self.visit_AsmOperandNode(out_op)
+            out_constraints.append(constraint)
+            target_type = self.symbol_types[target_name]
+            out_types.append(target_type)
+            out_targets.append(target_name)
+
+        # Process input operands
+        in_constraints = []
+        in_values = []
+        in_types = []
+
+        for in_op in node.inputs:
+            constraint, val, _ = self.visit_AsmOperandNode(in_op)
+            in_constraints.append(self._decode_string_literal(constraint))
+            in_values.append(val)
+            in_types.append(val.type)
+
+        # Combine constraints (Outputs, Inputs, Clobbers)
+        all_constraints = [
+            self._decode_string_literal(constraint)
+            for constraint in out_constraints + in_constraints + node.clobbers
+        ]
+        constraint_str = ",".join(all_constraints)
+
+        # Determine assembly function signature
+        if len(out_types) == 0:
+            ret_type = ir.VoidType()
+        elif len(out_types) == 1:
+            ret_type = out_types[0]
+        else:
+            ret_type = ir.LiteralStructType(out_types)
+
+        asm_fn_type = ir.FunctionType(ret_type, in_types)
+        inline_asm = ir.InlineAsm(
+            asm_fn_type,
+            asm_template,
+            constraint_str,
+            side_effect=node.is_volatile
+        )
+
+        res = self.builder.call(inline_asm, in_values)
+
+        # Map execution outputs back to variables
+        if len(out_targets) == 1:
+            self.builder.store(res, self.symbol_table[out_targets[0]])
+        elif len(out_targets) > 1:
+            for idx, name in enumerate(out_targets):
+                val_extracted = self.builder.extract_value(res, idx)
+                self.builder.store(val_extracted, self.symbol_table[name])
+
+        return res
+
+    def visit_BinaryOpNode(self, node: BinaryOpNode) -> ir.Value:
+        if node.op == "=":
+            if not isinstance(node.left, IdentifierNode) or node.left.name not in self.symbol_table:
+                raise CodeGenError("Assignment target must be a declared variable")
+            target_type = self.symbol_types[node.left.name]
+            value = self._coerce(self.generate(node.right), target_type)
+            self.builder.store(value, self.symbol_table[node.left.name])
+            return value
+
+        left = self.generate(node.left)
+        right = self.generate(node.right)
+        if node.op in ("&&", "||"):
+            left, right = self._as_bool(left), self._as_bool(right)
+            return self.builder.and_(left, right) if node.op == "&&" else self.builder.or_(left, right)
+
+        if self._is_float(left.type) or self._is_float(right.type):
+            common_type = ir.DoubleType() if isinstance(left.type, ir.DoubleType) or isinstance(right.type, ir.DoubleType) else ir.FloatType()
+            left, right = self._coerce(left, common_type), self._coerce(right, common_type)
+            arithmetic = {"+": self.builder.fadd, "-": self.builder.fsub, "*": self.builder.fmul, "/": self.builder.fdiv, "%": self.builder.frem}
+            comparisons = {"<": "<", "<=": "<=", ">": ">", ">=": ">=", "==": "==", "!=": "!="}
+            if node.op in arithmetic:
+                return arithmetic[node.op](left, right)
+            if node.op in comparisons:
+                return self.builder.fcmp_ordered(comparisons[node.op], left, right)
+
+        if self._is_integer(left.type) and self._is_integer(right.type):
+            common_type = left.type if left.type.width >= right.type.width else right.type
+            left, right = self._coerce(left, common_type), self._coerce(right, common_type)
+            arithmetic = {"+": self.builder.add, "-": self.builder.sub, "*": self.builder.mul, "/": self.builder.sdiv, "%": self.builder.srem, "&": self.builder.and_, "|": self.builder.or_, "^": self.builder.xor, "<<": self.builder.shl, ">>": self.builder.ashr}
+            comparisons = {"<": "<", "<=": "<=", ">": ">", ">=": ">=", "==": "==", "!=": "!="}
+            if node.op in arithmetic:
+                return arithmetic[node.op](left, right)
+            if node.op in comparisons:
+                return self.builder.icmp_signed(comparisons[node.op], left, right)
+        raise CodeGenError(f"Binary operator {node.op} not implemented for {left.type} and {right.type}")
+
+    def visit_UnaryOpNode(self, node: UnaryOpNode):
+        if node.op == "&":
+            if not isinstance(node.operand, IdentifierNode):
+                raise CodeGenError("Address-of operator requires a variable")
+            if node.operand.name not in self.symbol_table:
+                raise CodeGenError(f"Undefined variable: {node.operand.name}")
+            return self.symbol_table[node.operand.name]
+
+        value = self.generate(node.operand)
+        if node.op == "-":
+            return self.builder.fsub(self._zero(value.type), value) if self._is_float(value.type) else self.builder.neg(value)
+        if node.op == "!":
+            return self.builder.icmp_unsigned("==", self._as_bool(value), ir.Constant(ir.IntType(1), 0))
+        if node.op == "~" and self._is_integer(value.type):
+            return self.builder.not_(value)
+        raise CodeGenError(f"Unary operator {node.op} not implemented for {value.type}")
+
+    def visit_LiteralNode(self, node: LiteralNode) -> ir.Constant:
+        value = node.value
+        if isinstance(value, str) and value.startswith('"') and value.endswith('"'):
+            text = bytes(value[1:-1], "utf-8").decode("unicode_escape") + "\0"
+            global_value = self.string_constants.get(text)
+            if global_value is None:
+                array_type = ir.ArrayType(ir.IntType(8), len(text.encode("utf-8")))
+                global_value = ir.GlobalVariable(self.module, array_type, name=f".str.{len(self.string_constants)}")
+                global_value.linkage = "private"
+                global_value.global_constant = True
+                global_value.initializer = ir.Constant(array_type, bytearray(text.encode("utf-8")))
+                self.string_constants[text] = global_value
+            zero = ir.Constant(ir.IntType(32), 0)
+            return self.builder.gep(global_value, [zero, zero], inbounds=True, name="strtmp")
+        if isinstance(value, str) and ("." in value or "e" in value.lower()):
+            return ir.Constant(ir.DoubleType(), float(value))
+        return ir.Constant(ir.IntType(32), int(value, 0) if isinstance(value, str) else int(value))
+
+    def visit_IdentifierNode(self, node: IdentifierNode) -> ir.Instruction:
+        if node.name not in self.symbol_table:
+            raise CodeGenError(f"Undefined variable: {node.name}")
+        ptr = self.symbol_table[node.name]
+        return self.builder.load(ptr, typ=self.symbol_types[node.name], name=node.name)
+
+    def visit_FnCallNode(self, node: FnCallNode) -> ir.Instruction:
+        func = self.module.globals.get(node.name)
+        if not isinstance(func, ir.Function):
+            raise CodeGenError(f"Undefined function: {node.name}")
+        expected_types = func.function_type.args
+        if len(expected_types) != len(node.args):
+            raise CodeGenError(f"Function {node.name} expects {len(expected_types)} argument(s)")
+        args = [self._coerce(self.generate(arg), expected_types[index]) for index, arg in enumerate(node.args)]
+        if isinstance(func.function_type.return_type, ir.VoidType):
+            return self.builder.call(func, args)
+        return self.builder.call(func, args, name="calltmp")
+
+    def visit_ReturnNode(self, node: ReturnNode) -> ir.Instruction:
+        return_type = self.current_fn.function_type.return_type
+        if node.expression is None:
+            if not isinstance(return_type, ir.VoidType):
+                raise CodeGenError("Non-void function must return a value")
+            return self.builder.ret_void()
+        if isinstance(return_type, ir.VoidType):
+            raise CodeGenError("Void function cannot return a value")
+        return self.builder.ret(self._coerce(self.generate(node.expression), return_type))
+
+    def visit_IfNode(self, node: IfNode) -> None:
+        cond_val = self._as_bool(self.generate(node.condition))
+
+        then_bb = self.current_fn.append_basic_block("then")
+        else_bb = (
+            self.current_fn.append_basic_block("else")
+            if node.else_branch
+            else None
+        )
+        merge_bb = self.current_fn.append_basic_block("ifcont")
+
+        self.builder.cbranch(cond_val, then_bb, else_bb or merge_bb)
+
+        self.builder.position_at_start(then_bb)
+        self.generate(node.then_branch)
+        if not then_bb.is_terminated:
+            self.builder.branch(merge_bb)
+
+        if else_bb:
+            self.builder.position_at_start(else_bb)
+            self.generate(node.else_branch)
+            if not else_bb.is_terminated:
+                self.builder.branch(merge_bb)
+
+        self.builder.position_at_start(merge_bb)
+
+    def visit_WhileNode(self, node: WhileNode) -> None:
+        cond_bb = self.current_fn.append_basic_block("while.cond")
+        body_bb = self.current_fn.append_basic_block("while.body")
+        end_bb = self.current_fn.append_basic_block("while.end")
+
+        self.builder.branch(cond_bb)
+        self.builder.position_at_start(cond_bb)
+
+        cond_val = self._as_bool(self.generate(node.condition))
+        self.builder.cbranch(cond_val, body_bb, end_bb)
+
+        self.builder.position_at_start(body_bb)
+        self.generate(node.body)
+        if not self.builder.block.is_terminated:
+            self.builder.branch(cond_bb)
+
+        self.builder.position_at_start(end_bb)

@@ -1,25 +1,14 @@
 import os
-
+import subprocess
 
 def execute_command(command: str) -> int:
     """Executes a shell command and returns its exit status code."""
-    return os.system(command)
+    return subprocess.run(command, shell=True).returncode
 
 
-def run_build_pipeline(asm_filepath: str, executable_filepath: str) -> None:
-    """Assembles with NASM and links with LD using os.system."""
-    obj_filepath = f"{executable_filepath}.o"
+def run_build_pipeline(ir_filepath: str, executable_filepath: str) -> None:
+    """Compiles LLVM IR (.ll) to an executable using Clang."""
+    clang_cmd = f"clang -O2 {ir_filepath} -o {executable_filepath} -nostdlib"
 
-    # 1. Assemble with NASM
-    nasm_cmd = f"nasm -f elf64 {asm_filepath} -o {obj_filepath}"
-    if os.system(nasm_cmd) != 0:
-        raise RuntimeError(f"NASM assembly failed for target '{asm_filepath}'")
-
-    # 2. Link with LD
-    ld_cmd = f"ld {obj_filepath} -o {executable_filepath}"
-    if os.system(ld_cmd) != 0:
-        raise RuntimeError(f"LD linking failed for object '{obj_filepath}'")
-
-    # Cleanup object file
-    if os.path.exists(obj_filepath):
-        os.remove(obj_filepath)
+    if subprocess.run(clang_cmd, shell=True).returncode != 0:
+        raise RuntimeError(f"Clang compilation failed for target '{ir_filepath}'")

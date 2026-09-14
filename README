@@ -1,7 +1,7 @@
 # Bonobo
 
-Bonobo é uma linguagem pequena, compilada para assembly NASM x86-64 em
-ambientes Linux. O compilador implementa um pipeline direto:
+Bonobo é uma linguagem pequena, compilada para LLVM IR em ambientes Linux.
+O compilador implementa um pipeline direto:
 
 ```text
 arquivo .bon
@@ -9,8 +9,8 @@ arquivo .bon
 	-> lexer
 	-> parser recursivo descendente
 	-> AST
-	-> gerador de assembly NASM
-	-> NASM + LD (opcional)
+	-> gerador de LLVM IR
+	-> Clang (opcional)
 ```
 
 Este documento descreve a sintaxe que o código atual aceita, apresenta um
@@ -28,20 +28,18 @@ A linguagem já possui suporte sintático para:
 - chamadas de funções;
 - `if`/`else`, `while` e `for`;
 - `return`;
-- blocos de assembly embutido;
+- blocos de assembly inline LLVM;
 - arquivos de inclusão por meio de `include.bon`.
 
-O backend gera assembly para Linux x86-64 usando a convenção de chamada
-System V AMD64. O programa gerado começa em `_start`, chama `func_main` e
-termina usando a syscall `exit` com o valor retornado por `func_main`.
+O backend gera LLVM IR para a arquitetura alvo do Clang. O programa gerado
+define `func_main` e um ponto de entrada `_start`.
 
 ## Requisitos
 
-Para gerar somente o assembly, é necessário Python 3. Para montar e linkar um
-executável, também são necessários:
+Para gerar somente o LLVM IR, é necessário Python 3 e `llvmlite`. Para
+compilar um executável, também é necessário:
 
-- NASM;
-- `ld` do toolchain GNU/binutils;
+- Clang;
 - Linux x86-64.
 
 O compilador usa apenas módulos da biblioteca padrão do Python.
@@ -77,7 +75,7 @@ def main() {
 }
 ```
 
-Compile para assembly:
+Gere LLVM IR:
 
 ```bash
 PYTHONPATH=src python src/main.py hello.bon
@@ -149,7 +147,7 @@ Strings são delimitadas por aspas duplas:
 let message = "hello, bonobo";
 ```
 
-O conteúdo é armazenado no assembly como uma sequência terminada em zero e
+O conteúdo é armazenado no LLVM IR como uma sequência terminada em zero e
 produz um ponteiro para essa sequência. O lexer atual não implementa escapes
 como `\\n`, `\\"` ou `\\\\`; uma string termina na próxima aspa dupla.
 
@@ -213,7 +211,7 @@ def add(left, right) {
 let result = add(20, 22);
 ```
 
-Cada função vira um label `func_<nome>` no assembly. Os seis primeiros
+Cada função vira uma função `func_<nome>` no LLVM IR. Os seis primeiros
 parâmetros são recebidos nos registradores da convenção System V:
 
 ```text
@@ -399,7 +397,7 @@ processador, não uma verificação feita pelo parser.
 >=   maior ou igual
 ```
 
-O resultado de uma comparação é normalizado pelo assembly para `0` ou `1`.
+O resultado de uma comparação é normalizado pelo LLVM IR para `0` ou `1`.
 
 ### Operadores bit a bit
 
@@ -426,134 +424,22 @@ a = b = 5;
 Apesar de ser sintaticamente válida, prefira atribuições isoladas para manter
 o código legível.
 
-## Assembly embutido
+## Assembly inline
 
-O lexer reconhece blocos assembly delimitados por chaves. O conteúdo não é
-validado pelo parser de Bonobo e é inserido no assembly gerado, linha a linha.
-As formas disponíveis são:
-
-| Forma | Seção NASM | Uso |
-| --- | --- | --- |
-| `asm { ... }` | `.text` | Compatibilidade e código executável |
-| `asm_text { ... }` | `.text` | Código executável explícito |
-| `asm_data { ... }` | `.data` | Dados inicializados |
-| `asm_rodata { ... }` | `.rodata` | Dados inicializados somente para leitura |
-| `asm_bss { ... }` | `.bss` | Dados reservados sem inicialização |
-| `asm_return { ... }` | `.text` | Retorna o valor deixado em `rax` |
-
-Exemplo com código na seção `.text`:
+A linguagem possui apenas um bloco de assembly: `asm { ... }`. O conteúdo é
+emitido como LLVM inline asm dentro da função atual. As formas antigas
+`asm_text`, `asm_return`, `asm_data`, `asm_rodata` e `asm_bss` não são aceitas.
 
 ```bonobo
 asm {
-	mov rax, 42
-	add rax, 1
+	nop
 };
 ```
 
-O ponto e vírgula depois do bloco é opcional:
-
-```bonobo
-asm {
-	xor rax, rax
-}
-```
-
-Dados podem ser enviados diretamente às seções correspondentes:
-
-```bonobo
-asm_data {
-message: db "hello", 0
-message_len equ $ - message - 1
-}
-
-asm_rodata {
-constant: dq 42
-}
-
-asm_bss {
-buffer: resq 16
-}
-```
-
-Os blocos `asm_data`, `asm_rodata` e `asm_bss` não são colocados dentro de
-`func_main`; eles são acumulados e emitidos nas seções `.data`, `.rodata` e
-`.bss` do assembly final. `asm` e `asm_text` são emitidos em `.text`.
-
-### Retornando valores do assembly inline
-
-Use `asm_return` dentro de uma função quando o assembly inline produzir o
-valor que deve ser devolvido ao chamador:
-
-```bonobo
-def is_ready() {
-	asm_return {
-		mov rax, 1
-	}
-}
-
-let ready = is_ready();
-```
-
-`asm_return` usa a convenção de retorno System V AMD64: o resultado precisa
-estar em `rax` antes do fim do bloco. O compilador então emite o epílogo da
-função e a instrução `ret`. A chamada Bonobo encontra o resultado novamente em
-`rax`, portanto ele pode ser usado em uma declaração, atribuição ou como
-retorno de outra função:
-
-```bonobo
-def make_bool() {
-	asm_return {
-		xor rax, rax
-		cmp rdi, 0
-		setne al
-	}
-}
-
-def forward_bool() {
-	return make_bool();
-}
-
-let result = make_bool();
-```
-
-O mesmo mecanismo serve para ponteiros. Como uma string é representada por um
-endereço no assembly, `rax` pode receber um ponteiro para dados em `.data` ou
-`.rodata`:
-
-```bonobo
-asm_data {
-message: db "hello", 0
-}
-
-def message_pointer() {
-	asm_return {
-		lea rax, [message]
-	}
-}
-
-let pointer = message_pointer();
-```
-
-A convenção é deliberadamente explícita:
-
-```text
-entrada do asm_return:  assembly calcula o resultado
-registrador de retorno: rax
-saída para o chamador:  valor de rax após call
-```
-
-Para booleanos, deixe `rax` com `0` ou `1`. Para ponteiros, deixe em `rax` o
-endereço válido. O compilador não inspeciona nem valida o tipo desse valor; a
-responsabilidade de usar o registrador e preservar a convenção de chamada é
-do bloco assembly.
-
-`asm_return` pertence à seção `.text`. Usá-lo em `asm_data`, `asm_rodata` ou
-`asm_bss` é inválido, porque essas seções não podem retornar de uma função.
-
-O assembly precisa ser válido para NASM, e é responsabilidade do usuário
-respeitar registradores, pilha e a convenção de chamada. O reconhecimento
-termina na primeira `}` encontrada; chaves aninhadas não são suportadas pelo
-tokenizador dos blocos.
+O ponto e vírgula depois do bloco é opcional. O código precisa usar a sintaxe
+de assembly aceita pelo LLVM/Clang e respeitar a convenção de chamada do alvo.
+O reconhecimento termina na primeira `}`; chaves aninhadas não são suportadas
+pelo tokenizador dos blocos.
 
 ## Inclusões com `include.bon`
 
@@ -658,7 +544,6 @@ def accumulate(limit) {
 let result = accumulate(5);
 
 asm {
-	; O código é copiado para o assembly NASM.
 	nop
 }
 ```
@@ -669,7 +554,7 @@ O parser cria um nó `Program` contendo funções e instruções de nível super
 O gerador então:
 
 1. registra as funções declaradas;
-2. gera cada função com prólogo e epílogo usando `rbp`;
+2. gera cada função com prólogo e epílogo LLVM;
 3. coloca instruções fora de funções em `func_main`;
 4. cria as seções `.data` para strings e `.bss` para variáveis globais;
 5. gera `_start`, que chama `func_main` e usa seu resultado como código de

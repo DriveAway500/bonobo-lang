@@ -12,7 +12,7 @@ class CLIArgs(NamedTuple):
 def parse_args() -> CLIArgs:
     """Parses command line arguments for the compiler interface."""
     parser = argparse.ArgumentParser(
-        description="Simple NASM x86_64 compiler pipeline."
+        description="Simple LLVM IR compiler pipeline."
     )
 
     parser.add_argument(
@@ -24,14 +24,14 @@ def parse_args() -> CLIArgs:
     parser.add_argument(
         "-c", "--compile",
         action="store_true",
-        help="Assemble and link the generated NASM code into an executable"
+        help="Compile the generated LLVM IR into an executable"
     )
 
     args = parser.parse_args()
 
     # Always derive output filename from source file name
     base_name, _ = os.path.splitext(args.source)
-    output_path = f"{base_name}.asm"
+    output_path = f"{base_name}.ll"
 
     return CLIArgs(
         source_path=args.source,
