@@ -48,9 +48,22 @@ class WhileNode(ASTNode):
         self.condition = condition
         self.body = body
 
+class ForNode(ASTNode):
+    def __init__(self, init, condition, update, body):
+        self.init = init
+        self.condition = condition
+        self.update = update
+        self.body = body
+
 class ReturnNode(ASTNode):
     def __init__(self, expression):
         self.expression = expression
+
+class BreakNode(ASTNode):
+    pass
+
+class ContinueNode(ASTNode):
+    pass
 
 # --- New Assembly AST Nodes ---
 
@@ -134,7 +147,10 @@ def p_statement(p):
                  | struct_decl
                  | if_statement
                  | while_statement
+                 | for_statement
                  | return_statement SEMI
+                 | break_statement SEMI
+                 | continue_statement SEMI
                  | asm_statement SEMI
                  | expr_statement SEMI
                  | block'''
@@ -201,8 +217,11 @@ def p_struct_field(p):
 # Control Flow
 def p_if_statement(p):
     '''if_statement : IF expression block ELSE block
+                    | IF expression block ELSE if_statement
                     | IF expression block'''
     if len(p) == 6:
+        # Covers both "else { ... }" and "else if ... { ... }" (p[5] is a
+        # BlockNode in the former case and an IfNode in the latter).
         p[0] = IfNode(p[2], p[3], p[5])
     else:
         p[0] = IfNode(p[2], p[3], None)
@@ -211,10 +230,45 @@ def p_while_statement(p):
     '''while_statement : WHILE expression block'''
     p[0] = WhileNode(p[2], p[3])
 
+
+def p_for_statement(p):
+    '''for_statement : FOR '(' for_init SEMI for_condition SEMI for_update ')' block'''
+    p[0] = ForNode(p[3], p[5], p[7], p[9])
+
+
+def p_for_init(p):
+    '''for_init : var_decl
+                | expression
+                | empty'''
+    p[0] = p[1]
+
+
+def p_for_condition(p):
+    '''for_condition : expression
+                    | empty'''
+    p[0] = p[1]
+
+
+def p_for_update(p):
+    '''for_update : expression
+                 | empty'''
+    p[0] = p[1]
+
+
 def p_return_statement(p):
     '''return_statement : RETURN expression
                          | RETURN'''
     p[0] = ReturnNode(p[2] if len(p) == 3 else None)
+
+
+def p_break_statement(p):
+    '''break_statement : BREAK'''
+    p[0] = BreakNode()
+
+
+def p_continue_statement(p):
+    '''continue_statement : CONTINUE'''
+    p[0] = ContinueNode()
 
 
 # --- Inline Assembly Parsing Rules ---
@@ -313,6 +367,11 @@ def p_type(p):
             | IDENT'''
     p[0] = p[1]
 
+# Array types: [512 x i8]  (the 'x' separator lexes as a plain IDENT)
+def p_type_array(p):
+    '''type : '[' NUMBER IDENT type ']' '''
+    p[0] = f"[{p[2]} x {p[4]}]"
+
 # Expressions
 def p_expression_binop(p):
     '''expression : expression PLUS expression
@@ -340,7 +399,8 @@ def p_expression_unary(p):
     '''expression : MINUS expression %prec UNARY
                   | LOGICAL_NOT expression
                   | BIT_NOT expression
-                  | BIT_AND expression %prec UNARY'''
+                  | BIT_AND expression %prec UNARY
+                  | MUL expression %prec UNARY'''
     p[0] = UnaryOpNode(p[1], p[2])
 
 def p_expression_group(p):

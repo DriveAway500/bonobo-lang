@@ -20,8 +20,9 @@ reserved = {
     'short': 'TYPE_SHORT', 'long': 'TYPE_LONG', 'signed': 'TYPE_SIGNED',
     'unsigned': 'TYPE_UNSIGNED', '_Bool': 'TYPE_BOOL', 'bool': 'TYPE_BOOL',
     'let': 'LET', 'if': 'IF', 'elif': 'ELIF', 'else': 'ELSE',
-    'while': 'WHILE', 'for': 'FOR', 'def': 'DEF', 'fn': 'DEF', 'return': 'RETURN',
-    
+    'while': 'WHILE', 'for': 'FOR', 'def': 'DEF', 'fn': 'DEF',
+    'return': 'RETURN', 'break': 'BREAK', 'continue': 'CONTINUE',
+
     # Inline Assembly Keywords
     'asm': 'KEYWORD_ASM',
     'template': 'KEYWORD_TEMPLATE',

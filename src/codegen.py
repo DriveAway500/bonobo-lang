@@ -12,7 +12,10 @@ from parser import (
     AsmOperandNode,
     BinaryOpNode,
     BlockNode,
+    BreakNode,
+    ContinueNode,
     FnCallNode,
+    ForNode,
     FunctionDeclNode,
     IdentifierNode,
     IfNode,
@@ -40,6 +43,8 @@ class LLVMCodeGenerator:
 
         self.symbol_table: Dict[str, ir.AllocaInstr] = {}
         self.symbol_types: Dict[str, ir.Type] = {}
+        self.loop_break_stack: List[ir.BasicBlock] = []
+        self.loop_continue_stack: List[ir.BasicBlock] = []
         self.type_map: Dict[str, ir.Type] = {
             # iN is also resolved dynamically below for arbitrary widths.
             "bool": ir.IntType(1),
@@ -357,7 +362,20 @@ class LLVMCodeGenerator:
         alloca = self.builder.alloca(llvm_type, name=node.name)
 
         if value is not None:
-            self.builder.store(self._coerce(value, llvm_type), alloca)
+            if isinstance(llvm_type, ir.ArrayType):
+                # Array locals are declared with a placeholder scalar
+                # initializer (e.g. "let buf: [512 x i8] = 0;") that just
+                # reserves the stack space; it isn't coercible into the
+                # array type itself. We deliberately do NOT emit a store of
+                # a zeroinitializer constant here: for buffers this large,
+                # LLVM's backend lowers a single big aggregate store into a
+                # call to memset(), which fails to link in a freestanding
+                # binary (no libc, custom _start, raw syscalls). Programs
+                # using these scratch buffers are expected to fill them
+                # explicitly before reading, as this source already does.
+                pass
+            else:
+                self.builder.store(self._coerce(value, llvm_type), alloca)
 
         self.symbol_table[node.name] = alloca
         self.symbol_types[node.name] = llvm_type
@@ -445,6 +463,16 @@ class LLVMCodeGenerator:
 
     def visit_BinaryOpNode(self, node: BinaryOpNode) -> ir.Value:
         if node.op == "=":
+            # Assignment through a pointer dereference: *(addr_expr) = value;
+            # The language treats raw integer addresses as byte pointers, so
+            # dereferenced stores/loads always operate on a single byte (i8).
+            if isinstance(node.left, UnaryOpNode) and node.left.op == "*":
+                address = self.generate(node.left.operand)
+                pointer = self.builder.inttoptr(address, self.ptr_type)
+                value = self._coerce(self.generate(node.right), ir.IntType(8))
+                self.builder.store(value, pointer)
+                return value
+
             if not isinstance(node.left, IdentifierNode) or node.left.name not in self.symbol_table:
                 raise CodeGenError("Assignment target must be a declared variable")
             target_type = self.symbol_types[node.left.name]
@@ -454,6 +482,17 @@ class LLVMCodeGenerator:
 
         left = self.generate(node.left)
         right = self.generate(node.right)
+
+        # This language treats pointers as raw integer addresses everywhere
+        # else (e.g. "let base_addr: long = some_ptr;"), so arithmetic and
+        # comparisons involving a pointer operand implicitly decay it to its
+        # i64 address, matching how the rest of the program already uses
+        # pointer values in address arithmetic like "num_buf + written_len".
+        if self._is_pointer(left.type):
+            left = self.builder.ptrtoint(left, ir.IntType(64))
+        if self._is_pointer(right.type):
+            right = self.builder.ptrtoint(right, ir.IntType(64))
+
         if node.op in ("&&", "||"):
             left, right = self._as_bool(left), self._as_bool(right)
             return self.builder.and_(left, right) if node.op == "&&" else self.builder.or_(left, right)
@@ -486,6 +525,13 @@ class LLVMCodeGenerator:
             if node.operand.name not in self.symbol_table:
                 raise CodeGenError(f"Undefined variable: {node.operand.name}")
             return self.symbol_table[node.operand.name]
+
+        if node.op == "*":
+            # Pointer dereference. Addresses are plain integers in this
+            # language, so we cast to a byte pointer and load a single byte.
+            address = self.generate(node.operand)
+            pointer = self.builder.inttoptr(address, self.ptr_type)
+            return self.builder.load(pointer, typ=ir.IntType(8), name="deref")
 
         value = self.generate(node.operand)
         if node.op == "-":
@@ -542,6 +588,16 @@ class LLVMCodeGenerator:
             raise CodeGenError("Void function cannot return a value")
         return self.builder.ret(self._coerce(self.generate(node.expression), return_type))
 
+    def visit_BreakNode(self, node: BreakNode) -> None:
+        if not self.loop_break_stack:
+            raise CodeGenError("break can only be used inside a loop")
+        self.builder.branch(self.loop_break_stack[-1])
+
+    def visit_ContinueNode(self, node: ContinueNode) -> None:
+        if not self.loop_continue_stack:
+            raise CodeGenError("continue can only be used inside a loop")
+        self.builder.branch(self.loop_continue_stack[-1])
+
     def visit_IfNode(self, node: IfNode) -> None:
         cond_val = self._as_bool(self.generate(node.condition))
 
@@ -557,13 +613,18 @@ class LLVMCodeGenerator:
 
         self.builder.position_at_start(then_bb)
         self.generate(node.then_branch)
-        if not then_bb.is_terminated:
+        # Check the block the builder currently sits in, not then_bb itself:
+        # nested control flow (e.g. another if/while inside this branch)
+        # moves the builder to a different block by the time we get here.
+        if not self.builder.block.is_terminated:
             self.builder.branch(merge_bb)
 
         if else_bb:
             self.builder.position_at_start(else_bb)
             self.generate(node.else_branch)
-            if not else_bb.is_terminated:
+            # Same reasoning: an "else if" chain leaves the builder inside
+            # the innermost nested if's own merge block, not else_bb.
+            if not self.builder.block.is_terminated:
                 self.builder.branch(merge_bb)
 
         self.builder.position_at_start(merge_bb)
@@ -573,14 +634,54 @@ class LLVMCodeGenerator:
         body_bb = self.current_fn.append_basic_block("while.body")
         end_bb = self.current_fn.append_basic_block("while.end")
 
+        self.loop_break_stack.append(end_bb)
+        self.loop_continue_stack.append(cond_bb)
+        try:
+            self.builder.branch(cond_bb)
+            self.builder.position_at_start(cond_bb)
+
+            cond_val = self._as_bool(self.generate(node.condition))
+            self.builder.cbranch(cond_val, body_bb, end_bb)
+
+            self.builder.position_at_start(body_bb)
+            self.generate(node.body)
+            if not self.builder.block.is_terminated:
+                self.builder.branch(cond_bb)
+
+            self.builder.position_at_start(end_bb)
+        finally:
+            self.loop_break_stack.pop()
+            self.loop_continue_stack.pop()
+
+    def visit_ForNode(self, node: ForNode) -> None:
+        cond_bb = self.current_fn.append_basic_block("for.cond")
+        body_bb = self.current_fn.append_basic_block("for.body")
+        update_bb = self.current_fn.append_basic_block("for.update")
+        end_bb = self.current_fn.append_basic_block("for.end")
+
+        if node.init is not None:
+            self.generate(node.init)
+
         self.builder.branch(cond_bb)
         self.builder.position_at_start(cond_bb)
 
-        cond_val = self._as_bool(self.generate(node.condition))
+        cond_val = self._as_bool(self.generate(node.condition)) if node.condition is not None else ir.Constant(ir.IntType(1), 1)
         self.builder.cbranch(cond_val, body_bb, end_bb)
 
         self.builder.position_at_start(body_bb)
-        self.generate(node.body)
+        self.loop_break_stack.append(end_bb)
+        self.loop_continue_stack.append(update_bb)
+        try:
+            self.generate(node.body)
+            if not self.builder.block.is_terminated:
+                self.builder.branch(update_bb)
+        finally:
+            self.loop_break_stack.pop()
+            self.loop_continue_stack.pop()
+
+        self.builder.position_at_start(update_bb)
+        if node.update is not None:
+            self.generate(node.update)
         if not self.builder.block.is_terminated:
             self.builder.branch(cond_bb)
 

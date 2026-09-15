@@ -26,14 +26,16 @@ class CompilerPipeline:
         print("-----------------------\n")
 
         print(f"=== [Stage 2: Lexical Analysis] ===")
-        lexer.input(source_code)
-        tokens = list(lexer)
+        token_lexer = lexer.clone()
+        token_lexer.input(source_code)
+        tokens = list(token_lexer)
         print(f"Generated {len(tokens)} token(s):")
         for i, token in enumerate(tokens):
             print(f"  [{i:03d}] {token}")
         print()
 
         print(f"=== [Stage 3: Parsing AST] ===")
+        lexer.input(source_code)
         ast = parser.parse(source_code, lexer=lexer)
         print("--- AST Representation ---")
         print(ast)
