@@ -1,4 +1,4 @@
-fn exit(){
+def exit(){
     asm volatile (
         template: "syscall",
         outputs: [],
@@ -11,7 +11,7 @@ fn exit(){
 }
 
 // Prints a standard string directly to stdout
-fn print_string(str_ptr: ptr) -> i64 {
+def print_string(str_ptr: ptr) -> i64 {
     let len: i64 = str_len(str_ptr);
     let bytes_written: i64 = 0;
 
@@ -31,7 +31,7 @@ fn print_string(str_ptr: ptr) -> i64 {
 }
 
 // Formats strings containing '{expr}' interpolations and prints to stdout
-fn print_interpolated(fmt_ptr: ptr, out_buf: ptr) -> i64 {
+def print_interpolated(fmt_ptr: ptr, out_buf: ptr) -> i64 {
     let fmt_addr: i64 = fmt_ptr;
     let out_addr: i64 = out_buf;
 
