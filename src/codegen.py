@@ -46,19 +46,13 @@ class LLVMCodeGenerator:
         self.loop_break_stack: List[ir.BasicBlock] = []
         self.loop_continue_stack: List[ir.BasicBlock] = []
         self.type_map: Dict[str, ir.Type] = {
-            # iN is also resolved dynamically below for arbitrary widths.
-            "bool": ir.IntType(1),
-            "_Bool": ir.IntType(1),
+            # Only genuine LLVM type names live here. Arbitrary widths not
+            # listed (i2, i24, i512, ...) are still resolved dynamically by
+            # the iN regex in _get_llvm_type.
             "i1": ir.IntType(1),
-            "char": ir.IntType(8),
             "i8": ir.IntType(8),
-            "short": ir.IntType(16),
             "i16": ir.IntType(16),
-            "int": ir.IntType(32),
-            "signed": ir.IntType(32),
-            "unsigned": ir.IntType(32),
             "i32": ir.IntType(32),
-            "long": ir.IntType(64),
             "i64": ir.IntType(64),
             "i128": ir.IntType(128),
             "half": self._optional_llvm_type("HalfType"),
@@ -90,7 +84,7 @@ class LLVMCodeGenerator:
 
     def _get_llvm_type(self, type_str: Optional[str]) -> ir.Type:
         if not type_str:
-            return self.type_map["int"]
+            return self.type_map["i32"]
         if type_str in self.type_map:
             return self.type_map[type_str]
         if type_str in self.struct_types:
@@ -357,7 +351,7 @@ class LLVMCodeGenerator:
     def visit_VarDeclNode(self, node: VarDeclNode) -> ir.AllocaInstr:
         value = self.generate(node.value) if node.value is not None else None
         llvm_type = self._get_llvm_type(node.type) if node.type else (
-            value.type if value is not None else self.type_map["int"]
+            value.type if value is not None else self.type_map["i32"]
         )
         alloca = self.builder.alloca(llvm_type, name=node.name)
 

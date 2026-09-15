@@ -354,17 +354,13 @@ def p_expr_statement(p):
 
 # Types
 def p_type(p):
-    '''type : TYPE_INT
-            | TYPE_CHAR
-            | TYPE_FLOAT
+    '''type : TYPE_FLOAT
             | TYPE_DOUBLE
             | TYPE_VOID
-            | TYPE_BOOL
-            | TYPE_SHORT
-            | TYPE_LONG
-            | TYPE_SIGNED
-            | TYPE_UNSIGNED
             | IDENT'''
+    # Sized integer types (i1, i8, i16, i32, i64, ...) and other named LLVM
+    # types (ptr, half, bfloat, fp128, ...) aren't reserved words; they are
+    # plain identifiers here and get resolved by codegen's type_map / iN regex.
     p[0] = p[1]
 
 # Array types: [512 x i8]  (the 'x' separator lexes as a plain IDENT)

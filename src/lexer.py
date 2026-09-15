@@ -15,10 +15,11 @@ tokens = (
 reserved = {
     'struct': 'KEYWORD_STRUCT', 'union': 'KEYWORD_UNION', 'enum': 'KEYWORD_ENUM',
     'typedef': 'KEYWORD_TYPEDEF', 'const': 'KEYWORD_CONST', 'volatile': 'KEYWORD_VOLATILE',
-    'restrict': 'KEYWORD_RESTRICT', 'int': 'TYPE_INT', 'char': 'TYPE_CHAR',
+    'restrict': 'KEYWORD_RESTRICT',
+    # Only base LLVM type keywords remain here; the sized integer types
+    # (i1, i8, i16, i32, ...) are not reserved words — they fall through
+    # to t_IDENT and are recognized by codegen's iN regex instead.
     'float': 'TYPE_FLOAT', 'double': 'TYPE_DOUBLE', 'void': 'TYPE_VOID',
-    'short': 'TYPE_SHORT', 'long': 'TYPE_LONG', 'signed': 'TYPE_SIGNED',
-    'unsigned': 'TYPE_UNSIGNED', '_Bool': 'TYPE_BOOL', 'bool': 'TYPE_BOOL',
     'let': 'LET', 'if': 'IF', 'elif': 'ELIF', 'else': 'ELSE',
     'while': 'WHILE', 'for': 'FOR', 'def': 'DEF', 'fn': 'DEF',
     'return': 'RETURN', 'break': 'BREAK', 'continue': 'CONTINUE',
