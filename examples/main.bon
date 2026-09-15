@@ -11,9 +11,9 @@ def exit(){
 }
 
 // Prints a standard string directly to stdout
-fn print_string(str_ptr: ptr) -> long {
-    let len: long = str_len(str_ptr);
-    let bytes_written: long = 0;
+fn print_string(str_ptr: ptr) -> i64 {
+    let len: i64 = str_len(str_ptr);
+    let bytes_written: i64 = 0;
 
     asm volatile (
         template: "syscall",
@@ -31,27 +31,27 @@ fn print_string(str_ptr: ptr) -> long {
 }
 
 // Formats strings containing '{expr}' interpolations and prints to stdout
-fn print_interpolated(fmt_ptr: ptr, out_buf: ptr) -> long {
-    let fmt_addr: long = fmt_ptr;
-    let out_addr: long = out_buf;
+fn print_interpolated(fmt_ptr: ptr, out_buf: ptr) -> i64 {
+    let fmt_addr: i64 = fmt_ptr;
+    let out_addr: i64 = out_buf;
 
-    let fmt_idx: long = 0;
-    let out_idx: long = 0;
+    let fmt_idx: i64 = 0;
+    let out_idx: i64 = 0;
 
     while *(fmt_addr + fmt_idx) != 0 && *(fmt_addr + fmt_idx) != 10 {
-        let c: char = *(fmt_addr + fmt_idx);
+        let c: i8 = *(fmt_addr + fmt_idx);
 
         if c == 123 { // '{'
             fmt_idx = fmt_idx + 1;
-            let expr_start: long = fmt_addr + fmt_idx;
-            let expr_len: long = 0;
+            let expr_start: i64 = fmt_addr + fmt_idx;
+            let expr_len: i64 = 0;
 
             while *(fmt_addr + fmt_idx) != 125 && *(fmt_addr + fmt_idx) != 0 {
                 expr_len = expr_len + 1;
                 fmt_idx = fmt_idx + 1;
             }
 
-            let val: long = eval_expr(expr_start, expr_len);
+            let val: i64 = eval_expr(expr_start, expr_len);
             out_idx = int_to_str(val, out_buf, out_idx);
 
         } else {
@@ -62,7 +62,7 @@ fn print_interpolated(fmt_ptr: ptr, out_buf: ptr) -> long {
         fmt_idx = fmt_idx + 1;
     }
 
-    let bytes_written: long = 0;
+    let bytes_written: i64 = 0;
     asm volatile (
         template: "syscall",
         outputs: [ "={rax}"(bytes_written) ],
@@ -78,24 +78,24 @@ fn print_interpolated(fmt_ptr: ptr, out_buf: ptr) -> long {
     return bytes_written;
 }
 
-// Evaluates a simple arithmetic expression string and returns a long
-fn eval_expr(expr_ptr: ptr, len: long) -> long {
-    let result: long = 0;
-    let current_op: char = 43; // Default operation '+' (ASCII 43)
-    let i: long = 0;
+// Evaluates a simple arithmetic expression string and returns an i64
+fn eval_expr(expr_ptr: ptr, len: i64) -> i64 {
+    let result: i64 = 0;
+    let current_op: i8 = 43; // Default operation '+' (ASCII 43)
+    let i: i64 = 0;
 
-    let base_addr: long = expr_ptr;
+    let base_addr: i64 = expr_ptr;
 
     while i < len {
-        let c: char = *(base_addr + i);
+        let c: i8 = *(base_addr + i);
 
         // Check if character is a digit ('0' <= c <= '9')
         if c >= 48 && c <= 57 {
-            let num: long = 0;
+            let num: i64 = 0;
 
             // Parse integer sequence
             while i < len && *(base_addr + i) >= 48 && *(base_addr + i) <= 57 {
-                let digit: char = *(base_addr + i);
+                let digit: i8 = *(base_addr + i);
                 num = num * 10 + (digit - 48);
                 i = i + 1;
             }
@@ -191,7 +191,7 @@ fn _start() {
 
     // Test 1: Write interpolated string template into memory
     // Expression: "Results: {1+1} and {10*5-2}\n"
-    let fmt_addr: long = format_str;
+    let fmt_addr: i64 = format_str;
     *(fmt_addr + 0)  = 82;  // 'R'
     *(fmt_addr + 1)  = 101; // 'e'
     *(fmt_addr + 2)  = 115; // 's'
@@ -226,7 +226,7 @@ fn _start() {
     print_interpolated(format_str, out_buf);
 
     // Test 2: Unit test int_to_str directly with negative values
-    let written_len: long = int_to_str(-42, num_buf, 0);
+    let written_len: i64 = int_to_str(-42, num_buf, 0);
     *(num_buf + written_len) = 10; // append newline
     *(num_buf + written_len + 1) = 0;
     print_string(num_buf);
