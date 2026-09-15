@@ -1,4 +1,4 @@
-def exit(){
+fn exit(){
     asm volatile (
         template: "syscall",
         outputs: [],
