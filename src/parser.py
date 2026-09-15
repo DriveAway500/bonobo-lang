@@ -1,6 +1,6 @@
 import ply.yacc as yacc
 
-# Import token list and lexer definition from your lexer
+# Import token list and lexer definition
 from lexer import lexer, tokens, reserved
 
 
@@ -75,10 +75,10 @@ class AsmOperandNode(ASTNode):
 class AsmBlockNode(ASTNode):
     def __init__(self, is_volatile, template, outputs, inputs, clobbers):
         self.is_volatile = is_volatile  # True/False
-        self.template = template        # String com a instrução ex: "syscall"
-        self.outputs = outputs          # Lista de AsmOperandNode
-        self.inputs = inputs            # Lista de AsmOperandNode
-        self.clobbers = clobbers        # Lista de strings ex: ["~{rcx}", "~{r11}"]
+        self.template = template        # String with inline assembly instruction: "syscall"
+        self.outputs = outputs          # List of AsmOperandNode
+        self.inputs = inputs            # List of AsmOperandNode
+        self.clobbers = clobbers        # List of strings ex: ["~{rcx}", "~{r11}"]
 
 # ------------------------------
 
