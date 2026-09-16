@@ -2,7 +2,7 @@
 
 **A complete walkthrough of the `lexer.py` → `parser.py` → `codegen.py` pipeline**
 
-This document describes how the three source files fit together as a compiler front end and back end. It is written to be read top-to-bottom as a single narrative: what each stage receives, what it produces, why it was designed that way, and where the seams are. It is **not** a modification guide — for that, see the per-file documentation (`lexer.md`, `parser.md`, `codegen.md`).
+This document describes how the three source files fit together as a compiler front end and back end. It is written to be read top-to-bottom as a single narrative: what each stage receives, what it produces, why it was designed that way, and where the seams are. It is **not** a modification guide — for that, see the per-file documentation (`LEXER.md`, `PARSER.md`, `CODEGEN.md`).
 
 ---
 
