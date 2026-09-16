@@ -3,6 +3,7 @@ codegen.py — Traverses the AST from parser.py and generates LLVM IR using mode
 """
 
 from typing import Dict, List, Optional, Tuple
+import llvmlite.binding as llvm
 import llvmlite.ir as ir
 import re
 
@@ -14,12 +15,14 @@ from parser import (
     BlockNode,
     BreakNode,
     ContinueNode,
+    EnumDeclNode,
     FnCallNode,
     ForNode,
     FunctionDeclNode,
     IdentifierNode,
     IfNode,
     LiteralNode,
+    MemberAccessNode,
     ProgramNode,
     ReturnNode,
     StructDeclNode,
@@ -33,11 +36,33 @@ class CodeGenError(Exception):
     pass
 
 
+_LLVM_INITIALIZED = False
+
+
+def initialize_llvm() -> None:
+    """Initialize LLVM's native target support once per process."""
+    global _LLVM_INITIALIZED
+    if _LLVM_INITIALIZED:
+        return
+    try:
+        llvm.initialize()
+    except RuntimeError as error:
+        # llvmlite 0.49+ initializes LLVM automatically and rejects the
+        # legacy call; older supported versions still require it.
+        if "initialization is now handled automatically" not in str(error):
+            raise
+    llvm.initialize_native_target()
+    llvm.initialize_native_asmprinter()
+    _LLVM_INITIALIZED = True
+
+
 class LLVMCodeGenerator:
     """AST visitor that generates modern LLVM IR (Opaque Pointers compliant)."""
 
     def __init__(self) -> None:
-        self.module = ir.Module(name="main_module")
+        initialize_llvm()
+        self.context = ir.Context()
+        self.module = ir.Module(name="main_module", context=self.context)
         self.builder: Optional[ir.IRBuilder] = None
         self.current_fn: Optional[ir.Function] = None
 
@@ -75,6 +100,20 @@ class LLVMCodeGenerator:
         self.type_map["string"] = self.ptr_type
         self.type_map["str"] = self.ptr_type
         self.struct_types: Dict[str, ir.IdentifiedStructType] = {}
+        self.struct_fields: Dict[str, Dict[str, Tuple[int, ir.Type]]] = {}
+        self.enum_values: Dict[str, int] = {}
+        self.enum_types: Dict[str, Dict[str, int]] = {}
+        # Each enum picks its own backing integer type (default i32, or
+        # whatever native type follows the ":" in its declaration, e.g.
+        # "enum PacketType : i8 { ... }"). enum_underlying_types maps the
+        # enum's own name to that type — mirrors how struct_types backs
+        # struct names — so it resolves wherever a type is expected
+        # (params, fields, var decls, return types). enum_value_types keeps
+        # the same per-entry type alongside enum_values (bare and qualified
+        # variant names) so a constant is always built with the right width.
+        self.enum_underlying_types: Dict[str, ir.Type] = {}
+        self.enum_value_types: Dict[str, ir.Type] = {}
+        self.pointer_pointees: Dict[str, ir.Type] = {}
         self.string_constants: Dict[str, ir.GlobalVariable] = {}
 
     @staticmethod
@@ -89,6 +128,8 @@ class LLVMCodeGenerator:
             return self.type_map[type_str]
         if type_str in self.struct_types:
             return self.struct_types[type_str]
+        if type_str in self.enum_underlying_types:
+            return self.enum_underlying_types[type_str]
         if type_str.endswith("*"):
             return ir.PointerType()
         integer_match = re.fullmatch(r"i([1-9][0-9]*)", type_str)
@@ -283,12 +324,56 @@ class LLVMCodeGenerator:
         visitor = getattr(self, method_name, self.generic_visit)
         return visitor(node)
 
+    def generate_optimized_ir(self, node, opt_level: int = 3) -> str:
+        """Generate verified LLVM IR and run LLVM's target optimization pipeline.
+
+        This method consumes the generator's module once. Create a new
+        ``LLVMCodeGenerator`` when compiling another AST.
+        """
+        if isinstance(opt_level, bool) or not isinstance(opt_level, int):
+            raise ValueError("opt_level must be an integer from 0 to 3")
+        if opt_level not in range(4):
+            raise ValueError("opt_level must be an integer from 0 to 3")
+
+        raw_module = self.generate(node)
+        optimized_module = llvm.parse_assembly(str(raw_module))
+        optimized_module.verify()
+
+        target_machine = llvm.Target.from_default_triple().create_target_machine()
+        if hasattr(llvm, "PassManagerBuilder"):
+            pass_manager_builder = llvm.PassManagerBuilder()
+            pass_manager_builder.opt_level = opt_level
+            module_pass_manager = llvm.ModulePassManager()
+            target_machine.add_analysis_passes(module_pass_manager)
+            pass_manager_builder.populate(module_pass_manager)
+            module_pass_manager.run(optimized_module)
+        else:
+            # LLVM 22 removed the legacy PassManagerBuilder API. Its new
+            # pipeline exposes speed levels 0..2, so O3 uses the strongest
+            # available default pipeline just like O2 on that API.
+            tuning_options = llvm.create_pipeline_tuning_options(
+                speed_level=min(opt_level, 2)
+            )
+            pass_builder = llvm.create_pass_builder(target_machine, tuning_options)
+            module_pass_manager = pass_builder.getModulePassManager()
+            module_pass_manager.run(optimized_module, pass_builder)
+        optimized_module.verify()
+        return str(optimized_module)
+
     def generic_visit(self, node):
         raise CodeGenError(f"No visit_{type(node).__name__} method defined.")
 
     # ---- AST Node Visitors --------------------------------------------------
 
     def visit_ProgramNode(self, node: ProgramNode) -> ir.Module:
+        # Enums first: they have no dependencies on other declarations and
+        # resolve to a plain integer type, so registering all of them up
+        # front lets struct fields / function signatures reference an enum
+        # declared later in the source, matching how nested struct-in-struct
+        # already relies on declaration order for by-value fields.
+        for stmt in node.statements:
+            if isinstance(stmt, EnumDeclNode):
+                self.generate(stmt)
         for stmt in node.statements:
             if isinstance(stmt, StructDeclNode):
                 self.generate(stmt)
@@ -303,8 +388,42 @@ class LLVMCodeGenerator:
     def visit_StructDeclNode(self, node: StructDeclNode):
         struct_type = self.module.context.get_identified_type(node.name)
         self.struct_types[node.name] = struct_type
-        struct_type.set_body(*(self._get_llvm_type(field_type) for _, field_type in node.fields))
+        field_types = [self._get_llvm_type(field_type) for _, field_type in node.fields]
+        struct_type.set_body(*field_types)
+        self.struct_fields[node.name] = {
+            field_name: (index, field_types[index])
+            for index, (field_name, _) in enumerate(node.fields)
+        }
         return struct_type
+
+    def visit_EnumDeclNode(self, node: EnumDeclNode):
+        # No explicit "enum Name : type { ... }" backing type -> default to
+        # this language's native i32, same as an untyped "let" would get.
+        underlying_type = (
+            self._get_llvm_type(node.underlying_type)
+            if node.underlying_type
+            else self.type_map["i32"]
+        )
+        if not self._is_integer(underlying_type):
+            raise CodeGenError(
+                f"Enum {node.name} underlying type must be an integer type, got {node.underlying_type}"
+            )
+        self.enum_underlying_types[node.name] = underlying_type
+
+        next_value = 0
+        self.enum_types[node.name] = {}
+        for name, explicit_value in node.variants:
+            if explicit_value is not None:
+                next_value = explicit_value
+            qualified_name = f"{node.name}.{name}"
+            if name in self.enum_values or qualified_name in self.enum_values:
+                raise CodeGenError(f"Duplicate enum variant: {name}")
+            self.enum_values[name] = next_value
+            self.enum_values[qualified_name] = next_value
+            self.enum_value_types[name] = underlying_type
+            self.enum_value_types[qualified_name] = underlying_type
+            self.enum_types[node.name][name] = next_value
+            next_value += 1
 
     def _declare_function(self, node: FunctionDeclNode) -> ir.Function:
         param_types = [self._get_llvm_type(ptype) for _, ptype in node.params]
@@ -323,6 +442,7 @@ class LLVMCodeGenerator:
         self.current_fn = func
         self.symbol_table = {}
         self.symbol_types = {}
+        self.pointer_pointees = {}
 
         for arg, (pname, ptype) in zip(func.args, node.params):
             alloc_type = self._get_llvm_type(ptype)
@@ -330,6 +450,8 @@ class LLVMCodeGenerator:
             self.builder.store(arg, alloca)
             self.symbol_table[pname] = alloca
             self.symbol_types[pname] = alloc_type
+            if ptype.endswith("*") and ptype[:-1] in self.struct_types:
+                self.pointer_pointees[pname] = self.struct_types[ptype[:-1]]
 
         self.generate(node.body)
 
@@ -373,6 +495,11 @@ class LLVMCodeGenerator:
 
         self.symbol_table[node.name] = alloca
         self.symbol_types[node.name] = llvm_type
+        if node.type and node.type.endswith("*") and node.type[:-1] in self.struct_types:
+            self.pointer_pointees[node.name] = self.struct_types[node.type[:-1]]
+        elif isinstance(node.value, UnaryOpNode) and node.value.op == "&":
+            _, pointee_type = self._address_of(node.value.operand)
+            self.pointer_pointees[node.name] = pointee_type
         return alloca
 
     def visit_AsmOperandNode(self, node: AsmOperandNode) -> Tuple[str, ir.Value, Optional[str]]:
@@ -467,8 +594,13 @@ class LLVMCodeGenerator:
                 self.builder.store(value, pointer)
                 return value
 
+            if isinstance(node.left, MemberAccessNode):
+                target_address, target_type = self._member_address(node.left)
+                value = self._coerce(self.generate(node.right), target_type)
+                self.builder.store(value, target_address)
+                return value
             if not isinstance(node.left, IdentifierNode) or node.left.name not in self.symbol_table:
-                raise CodeGenError("Assignment target must be a declared variable")
+                raise CodeGenError("Assignment target must be a declared variable or struct member")
             target_type = self.symbol_types[node.left.name]
             value = self._coerce(self.generate(node.right), target_type)
             self.builder.store(value, self.symbol_table[node.left.name])
@@ -556,11 +688,25 @@ class LLVMCodeGenerator:
 
     def visit_IdentifierNode(self, node: IdentifierNode) -> ir.Instruction:
         if node.name not in self.symbol_table:
+            if node.name in self.enum_values:
+                return ir.Constant(self.enum_value_types[node.name], self.enum_values[node.name])
             raise CodeGenError(f"Undefined variable: {node.name}")
         ptr = self.symbol_table[node.name]
         return self.builder.load(ptr, typ=self.symbol_types[node.name], name=node.name)
 
     def visit_FnCallNode(self, node: FnCallNode) -> ir.Instruction:
+        if node.name in self.struct_types:
+            field_types = self.struct_types[node.name].elements
+            if len(field_types) != len(node.args):
+                raise CodeGenError(
+                    f"Struct {node.name} expects {len(field_types)} field value(s)"
+                )
+            value = ir.Constant(self.struct_types[node.name], None)
+            for index, (argument, field_type) in enumerate(zip(node.args, field_types)):
+                value = self.builder.insert_value(
+                    value, self._coerce(self.generate(argument), field_type), index
+                )
+            return value
         func = self.module.globals.get(node.name)
         if not isinstance(func, ir.Function):
             raise CodeGenError(f"Undefined function: {node.name}")
@@ -571,6 +717,66 @@ class LLVMCodeGenerator:
         if isinstance(func.function_type.return_type, ir.VoidType):
             return self.builder.call(func, args)
         return self.builder.call(func, args, name="calltmp")
+
+    def _member_address(self, node: MemberAccessNode) -> Tuple[ir.Value, ir.Type]:
+        """Return a field address and type, retaining enough type information for opaque pointers."""
+        if node.through_pointer:
+            if isinstance(node.value, UnaryOpNode) and node.value.op == "&":
+                base_address, base_type = self._address_of(node.value.operand)
+            elif isinstance(node.value, IdentifierNode):
+                if node.value.name not in self.pointer_pointees:
+                    raise CodeGenError("The -> operator requires a typed struct pointer")
+                pointer_slot = self.symbol_table[node.value.name]
+                base_address = self.builder.load(
+                    pointer_slot, typ=self.symbol_types[node.value.name], name="struct_ptr"
+                )
+                base_type = self.pointer_pointees[node.value.name]
+            else:
+                raise CodeGenError("The -> operator requires a typed struct pointer")
+        else:
+            base_address, base_type = self._address_of(node.value)
+
+        if not isinstance(base_type, ir.IdentifiedStructType):
+            raise CodeGenError(f"Member access requires a struct, got {base_type}")
+        fields = self.struct_fields.get(base_type.name, {})
+        if node.member not in fields:
+            raise CodeGenError(f"Struct {base_type.name} has no member '{node.member}'")
+        index, field_type = fields[node.member]
+        zero = ir.Constant(ir.IntType(32), 0)
+        gep_args = {
+            "inbounds": True,
+            "name": f"{node.member}_addr",
+        }
+        if getattr(base_address.type, "is_opaque", False):
+            gep_args["source_etype"] = base_type
+        address = self.builder.gep(
+            base_address, [zero, ir.Constant(ir.IntType(32), index)], **gep_args
+        )
+        return address, field_type
+
+    def _resolve_enum_member(self, enum_name: str, variant_name: str) -> ir.Constant:
+        qualified_name = f"{enum_name}.{variant_name}"
+        if qualified_name not in self.enum_values:
+            raise CodeGenError(f"Enum {enum_name} has no variant '{variant_name}'")
+        return ir.Constant(self.enum_value_types[qualified_name], self.enum_values[qualified_name])
+
+    def _address_of(self, node) -> Tuple[ir.Value, ir.Type]:
+        if isinstance(node, IdentifierNode):
+            if node.name not in self.symbol_table:
+                raise CodeGenError(f"Undefined variable: {node.name}")
+            return self.symbol_table[node.name], self.symbol_types[node.name]
+        if isinstance(node, MemberAccessNode):
+            return self._member_address(node)
+        raise CodeGenError("A struct member base must be a variable or another member")
+
+    def visit_MemberAccessNode(self, node: MemberAccessNode) -> ir.Value:
+        if isinstance(node.value, IdentifierNode):
+            enum_name = node.value.name
+            qualified_name = f"{enum_name}.{node.member}"
+            if qualified_name in self.enum_values:
+                return self._resolve_enum_member(enum_name, node.member)
+        address, field_type = self._member_address(node)
+        return self.builder.load(address, typ=field_type, name=node.member)
 
     def visit_ReturnNode(self, node: ReturnNode) -> ir.Instruction:
         return_type = self.current_fn.function_type.return_type

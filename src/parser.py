@@ -33,6 +33,20 @@ class StructDeclNode(ASTNode):
         self.name = name
         self.fields = fields
 
+class EnumDeclNode(ASTNode):
+    def __init__(self, name, variants, underlying_type=None):
+        self.name = name
+        self.variants = variants
+        # Optional explicit backing type, e.g. "enum PacketType : i8 { ... }".
+        # None means "let codegen pick the default integer type".
+        self.underlying_type = underlying_type
+
+class MemberAccessNode(ASTNode):
+    def __init__(self, value, member, through_pointer=False):
+        self.value = value
+        self.member = member
+        self.through_pointer = through_pointer
+
 class BlockNode(ASTNode):
     def __init__(self, statements):
         self.statements = statements
@@ -145,6 +159,7 @@ def p_statement(p):
     '''statement : function_decl
                  | var_decl SEMI
                  | struct_decl
+                 | enum_decl
                  | if_statement
                  | while_statement
                  | for_statement
@@ -213,6 +228,30 @@ def p_struct_field_list(p):
 def p_struct_field(p):
     '''struct_field : IDENT COLON type'''
     p[0] = (p[1], p[3])
+
+def p_enum_decl(p):
+    '''enum_decl : KEYWORD_ENUM IDENT '{' enum_variant_list '}'
+                 | KEYWORD_ENUM IDENT COLON type '{' enum_variant_list '}' '''
+    if len(p) == 6:
+        p[0] = EnumDeclNode(p[2], p[4])
+    else:
+        p[0] = EnumDeclNode(p[2], p[6], underlying_type=p[4])
+
+def p_enum_variant_list(p):
+    '''enum_variant_list : enum_variant_list COMMA enum_variant
+                         | enum_variant
+                         | empty'''
+    if len(p) == 4:
+        p[0] = p[1] + [p[3]]
+    elif len(p) == 2 and p[1] is not None:
+        p[0] = [p[1]]
+    else:
+        p[0] = []
+
+def p_enum_variant(p):
+    '''enum_variant : IDENT
+                    | IDENT ASSIGN NUMBER'''
+    p[0] = (p[1], int(p[3], 0) if len(p) == 4 else None)
 
 # Control Flow
 def p_if_statement(p):
@@ -357,11 +396,12 @@ def p_type(p):
     '''type : TYPE_FLOAT
             | TYPE_DOUBLE
             | TYPE_VOID
-            | IDENT'''
+            | IDENT
+            | IDENT MUL'''
     # Sized integer types (i1, i8, i16, i32, i64, ...) and other named LLVM
     # types (ptr, half, bfloat, fp128, ...) aren't reserved words; they are
     # plain identifiers here and get resolved by codegen's type_map / iN regex.
-    p[0] = p[1]
+    p[0] = p[1] + ("*" if len(p) == 3 else "")
 
 # Array types: [512 x i8]  (the 'x' separator lexes as a plain IDENT)
 def p_type_array(p):
@@ -417,6 +457,11 @@ def p_expression_identifier(p):
 def p_expression_call(p):
     '''expression : IDENT '(' arg_list ')' '''
     p[0] = FnCallNode(p[1], p[3])
+
+def p_expression_member(p):
+    '''expression : expression DOT IDENT
+                  | expression ARROW IDENT'''
+    p[0] = MemberAccessNode(p[1], p[3], through_pointer=p[2] == '->')
 
 def p_arg_list(p):
     '''arg_list : arg_list_nonempty

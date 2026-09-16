@@ -17,6 +17,10 @@ source .venv/bin/activate
 PYTHONPATH=src python src/main.py program.bon
 ```
 
+The code generator also exposes `generate_optimized_ir(ast, opt_level)` for
+LLVM optimization levels `0` through `3`. It returns verified optimized LLVM
+IR; use a new `LLVMCodeGenerator` instance for each AST compilation.
+
 To generate and compile an executable with Clang:
 
 ```bash
@@ -178,6 +182,28 @@ template semantically matches the declared registers.
   string.
 
 ## LLVM types
+
+## Structs and enums
+
+Struct fields are declared by name and can be initialized positionally with
+the struct name. Fields can be read or assigned with `.`. A typed pointer to a
+struct can use `->`:
+
+```bonobo
+struct Point { x: i32, y: i32 }
+
+enum Color { Red, Green = 4, Blue }
+
+fn distance_x() -> i32 {
+    let point: Point = Point(10, 20);
+    point.x = Green;
+    let point_ptr: Point* = &point;
+    return point_ptr->x;
+}
+```
+
+Enum variants are integer constants. Implicit values start at zero and then
+increment; an explicit value resets the next implicit value.
 
 The backend maps these names directly to `llvmlite.ir`:
 
