@@ -505,13 +505,19 @@ class LLVMCodeGenerator:
     def visit_AsmOperandNode(self, node: AsmOperandNode) -> Tuple[str, ir.Value, Optional[str]]:
         """Evaluates operand expression and returns constraint, value and target variable name."""
         target_var = None
+        # node.constraint is the raw lexer token and still carries its
+        # surrounding quotes (e.g. '"=r"'), so the '=' prefix that marks an
+        # output constraint must be checked on the decoded string — checking
+        # the raw token here always fails (it starts with '"'), which used
+        # to route every output operand through the input/load branch below.
+        decoded_constraint = self._decode_string_literal(node.constraint)
         if isinstance(node.expression, IdentifierNode):
             target_var = node.expression.name
             if target_var not in self.symbol_table:
                 raise CodeGenError(f"Undefined variable in asm operand: {target_var}")
             
             # If constraint indicates output ('='), pass alloca directly or evaluate
-            if node.constraint.startswith("="):
+            if decoded_constraint.startswith("="):
                 val = self.symbol_table[target_var]
             else:
                 ptr = self.symbol_table[target_var]
