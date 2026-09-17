@@ -472,4 +472,52 @@ Where each kind of change belongs, and what it forces.
 | Source positions | `t_newline` + track `lineno` | thread `lineno` through every AST node | include in `CodeGenError` messages |
 | Struct forward decls | — | — | split `visit_StructDeclNode` into "create shell" and "set body" passes |
 
-The table is not exhaustive, but its shape is the point: **the earlier a change lives in the pipeline, the more files it touches.** Most extensions land entirely in `codegen.py`; the exceptions are new syntax
+The table is not exhaustive, but its shape is the point: **the earlier a change lives in the pipeline, the more files it touches.** Most extensions land entirely in `codegen.py`; the exceptions are new syntax, which by definition requires all three stages, and new type shapes, which require mirroring across `p_type` and `p_cast_type` as described in §5.8.
+
+---
+
+## 8. Invariants Across the Pipeline
+
+These hold throughout the codebase. Breaking any of them silently breaks something downstream.
+
+1. **Raw text is preserved.** Literals, string tokens, and asm constraints retain their original spelling through the lexer and parser. Interpretation is a codegen concern.
+2. **Types are strings until codegen.** `i32`, `Point`, `[512 x i8]`, and typedef names are all strings in the AST.
+3. **The parser is a pure tree builder.** No type checking, no name resolution, no desugaring beyond `else if` collapsing and cast-wrapping.
+4. **Node class names are the dispatch key.** Renaming a node in `parser.py` requires renaming the corresponding `visit_<Name>` in `codegen.py`.
+5. **Statement order is preserved.** `BlockNode.statements` and `ProgramNode.statements` follow source order.
+6. **Opaque pointers in codegen.** Never inspect `.pointee`; use `pointer_pointees` and `source_etype=`.
+7. **LLVM integers are signless.** Signedness is chosen at each conversion site, and currently always signed.
+8. **Program passes are ordered typedefs → enums → structs → function decls → function defs.**
+9. **`type` and `cast_type` are kept in sync by hand.** They are not a shared non-terminal, and merging them is not safe without re-deriving the LALR conflict set.
+10. **Loop stacks are LIFO and cleaned up with `try/finally`.**
+11. **Terminated blocks are never appended to.** Always check `builder.block.is_terminated` before emitting a branch or instruction.
+
+---
+
+## 9. Reading Order
+
+For someone new to the codebase, the recommended reading order is the pipeline order:
+
+1. **`lexer.py`** — smallest file, establishes the vocabulary.
+2. **`parser.py`'s AST node definitions** — read the class definitions first, before the grammar. They document the shape of the language.
+3. **`parser.py`'s `precedence` tuple** — then the `p_*` functions, starting from `p_program` and following top-down.
+4. **`parser.py`'s `p_type` and `p_cast_type`** — read them side by side to see the deliberate duplication and the shapes both accept.
+5. **`codegen.py`'s `__init__`** — see what state is tracked. This is a map of the language's semantic concepts.
+6. **`codegen.py`'s `visit_ProgramNode`** — the entry point and pass structure.
+7. **`codegen.py`'s `_get_llvm_type`** — the type resolver, which is where the language's type vocabulary lives, including typedef expansion.
+8. **`codegen.py`'s `_coerce`** — the conversion engine, which is where type semantics live and where `visit_CastNode` ultimately delegates.
+9. **The `visit_*` methods** in the same order as the grammar rules.
+
+Reading in this order means every concept is introduced at the layer where it first appears, and every subsequent file builds on the one before.
+
+---
+
+## 10. Summary
+
+The compiler is a clean three-stage pipeline with a deliberately minimal lexer, a purely structural parser, and a semantics-heavy back end. The contracts between stages are narrow — tokens, AST, LLVM IR — and mostly defined by convention (raw text preservation, string-typed types, mirrored type non-terminals) rather than by validation. This keeps each stage comprehensible in isolation at the cost of late error detection.
+
+The design's real strength is that **most meaningful extensions live in a single file**. New types, new operators, new lowering strategies, new struct and enum representations, and new codegen features all land in `codegen.py`. Only genuinely new syntax requires touching all three stages, and even then the changes are localized: one regex in the lexer, one production in the parser, one visitor in the back end. The two places where duplication is intentional — `type` / `cast_type` in the parser, and `_coerce` / `_bitcast` in the back end — exist to keep the LALR grammar unambiguous and to keep "conversion" and "reinterpretation" as distinct concepts respectively.
+
+The design's real cost is that **errors are discovered late and without location information**. Both are consequences of the same choice — keep the front end dumb — and both are fixable without disturbing the overall architecture: add `t_newline` and thread `lineno` through AST nodes, and unify the three error surfaces into a single exception-based model. Neither requires rethinking the pipeline; both improve the developer experience substantially.
+
+If you take one thing away from this guide: **the pipeline is the API**. Each stage's output is a stable, well-understood artifact — tokens, AST, LLVM IR — and any change to the language should be understood as a change to one of those three contracts, with the corresponding ripple effects through the stages that produce and consume it.
