@@ -23,6 +23,7 @@ reserved = {
     'let': 'LET', 'if': 'IF', 'elif': 'ELIF', 'else': 'ELSE',
     'while': 'WHILE', 'for': 'FOR', 'def': 'DEF', 'fn': 'DEF',
     'return': 'RETURN', 'break': 'BREAK', 'continue': 'CONTINUE',
+    'as': 'AS',
 
     # Inline Assembly Keywords
     'asm': 'KEYWORD_ASM',

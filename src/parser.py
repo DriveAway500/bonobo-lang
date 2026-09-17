@@ -28,6 +28,11 @@ class VarDeclNode(ASTNode):
         self.type = var_type
         self.value = value
 
+class TypedefNode(ASTNode):
+    def __init__(self, name, target_type):
+        self.name = name
+        self.target_type = target_type
+
 class StructDeclNode(ASTNode):
     def __init__(self, name, fields):
         self.name = name
@@ -121,6 +126,11 @@ class FnCallNode(ASTNode):
         self.name = name
         self.args = args
 
+class CastNode(ASTNode):
+    def __init__(self, expression, target_type):
+        self.expression = expression
+        self.target_type = target_type
+
 
 # --- Operator Precedence and Associativity ---
 
@@ -136,6 +146,7 @@ precedence = (
     ('left', 'SHL', 'SHR'),
     ('left', 'PLUS', 'MINUS'),
     ('left', 'MUL', 'DIV', 'MOD'),
+    ('left', 'AS'),
     ('right', 'UNARY', 'LOGICAL_NOT', 'BIT_NOT'),
     ('left', 'DOT', 'ARROW'),
 )
@@ -158,6 +169,7 @@ def p_statement_list(p):
 def p_statement(p):
     '''statement : function_decl
                  | var_decl SEMI
+                 | typedef_decl SEMI
                  | struct_decl
                  | enum_decl
                  | if_statement
@@ -208,6 +220,14 @@ def p_var_decl(p):
         p[0] = VarDeclNode(is_mutable=False, name=p[2], var_type=None, value=p[4])
     else:
         p[0] = VarDeclNode(is_mutable=False, name=p[2], var_type=p[4], value=None)
+
+# Type aliases: typedef IntPtr = i32*;
+# The target is resolved lazily by codegen's _get_llvm_type whenever the
+# alias name is actually used as a type, so declaration order between a
+# typedef and the struct/enum it may point to doesn't matter.
+def p_typedef_decl(p):
+    '''typedef_decl : KEYWORD_TYPEDEF IDENT ASSIGN type'''
+    p[0] = TypedefNode(p[2], p[4])
 
 # Struct declarations: struct Point { x: int, y: int }
 def p_struct_decl(p):
@@ -406,7 +426,23 @@ def p_type(p):
 # Array types: [512 x i8]  (the 'x' separator lexes as a plain IDENT)
 def p_type_array(p):
     '''type : '[' NUMBER IDENT type ']' '''
+    if p[3] != 'x':
+        raise SyntaxError(f"Expected 'x' as array size separator, got '{p[3]}' (line {p.lineno(3)})")
     p[0] = f"[{p[2]} x {p[4]}]"
+
+# Vector types: <4 x i32>  (mirrors the array-type rule above; codegen's
+# _get_llvm_type already resolves "<N x T>" strings via its vector_match
+# regex into ir.VectorType, so this rule is the only piece that was
+# missing. LT/GT are reused here rather than introducing new tokens; since
+# 'type' is only ever entered from fixed points (after COLON, after
+# ARROW, or recursively as an array/vector element type) and never from
+# inside 'expression', this doesn't create any shift/reduce ambiguity
+# with LT/GT's use as comparison operators.
+def p_type_vector(p):
+    '''type : LT NUMBER IDENT type GT'''
+    if p[3] != 'x':
+        raise SyntaxError(f"Expected 'x' as vector size separator, got '{p[3]}' (line {p.lineno(3)})")
+    p[0] = f"<{p[2]} x {p[4]}>"
 
 # Expressions
 def p_expression_binop(p):
@@ -438,6 +474,48 @@ def p_expression_unary(p):
                   | BIT_AND expression %prec UNARY
                   | MUL expression %prec UNARY'''
     p[0] = UnaryOpNode(p[1], p[2])
+
+# Cast expression: value as type (e.g. "x as i64", "f as float").
+# %prec AS is required because the rule's rightmost symbol is the
+# nonterminal 'type', which carries no precedence of its own; without it
+# PLY would fall back to no precedence for this production and could not
+# resolve its shift/reduce interaction with the surrounding binary-operator
+# rules the same way the AS entry in the precedence table intends.
+def p_expression_cast(p):
+    '''expression : expression AS cast_type %prec AS'''
+    p[0] = CastNode(p[1], p[3])
+
+# cast_type is a self-contained duplicate of 'type' used only after AS.
+# Reusing 'type' itself here would make it reachable from inside
+# 'expression', enlarging FOLLOW(type) to include every binary-operator
+# token; since LALR states merge by grammar position, that would make
+# "type -> IDENT ." also treat MUL as a possible lookahead in the plain
+# declaration contexts (var decl, params, struct fields, ...), where MUL
+# is not actually meaningful. Keeping cast_type separate confines the one
+# resulting ambiguity to casts alone: with "x as T . " and a MUL
+# lookahead, the parser can't tell whether MUL starts a pointer type
+# ("x as T*") or is multiplication following a finished cast
+# ("x as T * y"); it defaults to shift (pointer type wins), so wrap the
+# cast in parens when multiplication is intended: "(x as T) * y".
+def p_cast_type(p):
+    '''cast_type : TYPE_FLOAT
+                 | TYPE_DOUBLE
+                 | TYPE_VOID
+                 | IDENT
+                 | IDENT MUL'''
+    p[0] = p[1] + ("*" if len(p) == 3 else "")
+
+def p_cast_type_array(p):
+    '''cast_type : '[' NUMBER IDENT cast_type ']' '''
+    if p[3] != 'x':
+        raise SyntaxError(f"Expected 'x' as array size separator, got '{p[3]}' (line {p.lineno(3)})")
+    p[0] = f"[{p[2]} x {p[4]}]"
+
+def p_cast_type_vector(p):
+    '''cast_type : LT NUMBER IDENT cast_type GT'''
+    if p[3] != 'x':
+        raise SyntaxError(f"Expected 'x' as vector size separator, got '{p[3]}' (line {p.lineno(3)})")
+    p[0] = f"<{p[2]} x {p[4]}>"
 
 def p_expression_group(p):
     '''expression : '(' expression ')' '''

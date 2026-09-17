@@ -45,6 +45,8 @@ tokens = tokens + tuple(set(reserved.values()))
 
 **Duplicate names:** if a token name appears in both the base tuple and `reserved.values()`, `tokens` will contain it twice. PLY tolerates this, but it's noise — keep names unique.
 
+**Note on order:** the manual tuple lists multi-character operators before their single-character counterparts (`LE` before `LT`, `EQ` before `ASSIGN`, etc.). This is convention, not a hard requirement for PLY variables (which are sorted by pattern length), but it keeps the source readable and matches the order PLY effectively applies.
+
 ---
 
 ## 3. Reserved Words
@@ -58,6 +60,7 @@ reserved = {
     'let': 'LET', 'if': 'IF', 'elif': 'ELIF', 'else': 'ELSE',
     'while': 'WHILE', 'for': 'FOR', 'def': 'DEF', 'fn': 'DEF',
     'return': 'RETURN', 'break': 'BREAK', 'continue': 'CONTINUE',
+    'as': 'AS',
     'asm': 'KEYWORD_ASM',
     'template': 'KEYWORD_TEMPLATE',
     'outputs': 'KEYWORD_OUTPUTS',
@@ -72,6 +75,9 @@ Reserved words are matched by `t_IDENT` and re-typed via `t.type = reserved.get(
 
 **Why sized integer types (`i32`, `i8`, ...) are absent:**
 The comment explains this: `i32`, `i8`, `ptr`, `string`, `half`, `bfloat`, etc. are **not** reserved. They lex as `IDENT` and are resolved by `codegen._get_llvm_type`. This is intentional — it lets the language add integer widths without touching the lexer. Only `float`, `double`, and `void` remain reserved because they're grammatical keywords in `p_type`.
+
+**Why `as` is reserved:**
+`as` is the cast keyword introduced alongside `p_expression_cast` in `parser.py`. It must be reserved (not an `IDENT`) so the parser can use it as a distinct token in the `expression AS cast_type` production without ambiguity with identifier uses. Because it's a reserved word, users cannot name a variable `as`.
 
 **If you add a type keyword here** (e.g. `bool`), remember you must also:
 1. Use its token name in `parser.p_type`'s alternatives.
@@ -208,6 +214,8 @@ t_SEMI        = r';'
 
 **`t_ignore_COMMENT`** (below) means `COMMENT` is never actually returned as a token — the `tokens` entry is vestigial.
 
+**Note on `AS`:** `as` is a reserved keyword (`reserved['as'] = 'AS'`), so it is not in this operator block. It is a word-like token matched by `t_IDENT`, not a symbolic operator. The `AS` entry in `parser.precedence` exists specifically to give `p_expression_cast` a precedence level via `%prec AS`.
+
 ### 5.4 Identifiers / keywords
 
 ```python
@@ -323,6 +331,8 @@ Built at import time.
 
 That's it — no changes to `tokens` needed (it's rebuilt from `reserved.values()`).
 
+**Reminder:** the new keyword becomes unavailable as an identifier. If that's a breaking change (e.g. you're adding `as` to a language that previously allowed `let as = 1;`), call it out in release notes.
+
 ### 7.3 Add a new numeric literal form
 
 **Recommended approach: convert to functions.**
@@ -408,6 +418,17 @@ def t_IDENT(t):
 
 This allows Unicode letters. Combine with `lex.lex(reflags=re.UNICODE)`. Note that `reserved` lookups are still ASCII-only, so Unicode keywords require Unicode keys.
 
+### 7.9 Add a new cast keyword
+
+If you want an alternative spelling for `as` (e.g. `cast`), add it as a reserved word mapping to the same token:
+
+```python
+'as': 'AS',
+'cast': 'AS',
+```
+
+Both spellings then produce `AS` tokens, and `p_expression_cast` works unchanged. Only do this if the language accepts both spellings — otherwise, pick one and keep the other as an identifier.
+
 ---
 
 ## 8. Debugging Tips
@@ -424,6 +445,7 @@ This allows Unicode letters. Combine with `lex.lex(reflags=re.UNICODE)`. Note th
 - **A rule fires too eagerly:** e.g. `t_LT` matching before `t_LE`. Since variables are sorted by pattern length, this means the two patterns have equal length — an impossible case for `LT` vs `LE`. Check that `t_LE`'s regex is `<=` and not `<` by accident.
 - **Stale `lextab.py`:** delete it if changes don't take effect.
 - **Silent token drops:** if `t_error` runs on a character you expected to match, the rule for that character isn't defined or isn't reachable (e.g. a literal `'<'` in `literals` would shadow `t_LT`).
+- **`AS` not producing a token:** verify `'as'` is in `reserved` and that the input is lowercase. `As` or `AS` lex as `IDENT`.
 
 ---
 
@@ -439,6 +461,7 @@ This allows Unicode letters. Combine with `lex.lex(reflags=re.UNICODE)`. Note th
 8. **Number tokens are strings.** `int(...)`/`float(...)` conversion is the parser/codegen's job.
 9. **No line tracking unless `t_newline` exists.** `t.lineno` is only useful if `\n` is not in `t_ignore`.
 10. **The lexer does not resolve types.** `i32`, `u64`, etc. are identifiers here.
+11. **`as` is a reserved word, not an operator.** It must be produced by `t_IDENT` via the `reserved` lookup, not by a `t_*` regex. Adding it to `literals` or the operator block would break the cast grammar.
 
 ---
 
@@ -466,3 +489,4 @@ If you extend the lexer, prefer:
 3. **Keeping the lexer dumb.** Semantic decisions belong to the parser or codegen.
 4. **Preserving raw token text.** Downstream code already relies on it (`AsmOperandNode.constraint`, `LiteralNode.value`, string tokens).
 5. **Adding new tokens to `tokens` only when they aren't reserved words.** Reserved words get their token names for free.
+6. **Treating new reserved words as breaking changes.** Adding `as` (or any future keyword) removes that spelling from the identifier namespace.

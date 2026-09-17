@@ -35,6 +35,7 @@ Each node is a thin data holder. If you add a field, you must update:
 | `ProgramNode` | `statements: list` | Root. |
 | `FunctionDeclNode` | `name, params, return_type, body` | `params` is a list of `(name, type_str)`. `return_type` is a string (`"void"` when absent). |
 | `VarDeclNode` | `is_mutable, name, var_type, value` | `is_mutable` is currently always `False` (see §6.1). `var_type` may be `None` for inferred types. |
+| `TypedefNode` | `name, target_type` | `target_type` is the raw type string the alias points to; resolved lazily by codegen. |
 | `StructDeclNode` | `name, fields` | `fields` is a list of `(name, type_str)`. |
 | `EnumDeclNode` | `name, variants, underlying_type` | `variants` is a list of `(name, int_or_None)`. `underlying_type` is `None` or a type string. |
 
@@ -68,10 +69,13 @@ Each node is a thin data holder. If you add a field, you must update:
 | `IdentifierNode` | `name` |
 | `FnCallNode` | `name, args` |
 | `MemberAccessNode` | `value, member, through_pointer (bool)` |
+| `CastNode` | `expression, target_type` |
 
 **Note:** `LiteralNode.value` is always a **string** — the raw token text. Conversion to int/float/string happens in `codegen.visit_LiteralNode`. Keep that in mind when adding literal types.
 
 **Note:** `FnCallNode.name` is a plain string, not an expression. This means method calls and function-pointer calls aren't representable. See §6.4.
+
+**Note:** `CastNode` is produced by `expression AS cast_type` (see §4.11). It carries only `expression` and a raw type string; codegen resolves the target and dispatches to `_coerce`.
 
 ---
 
@@ -90,12 +94,13 @@ precedence = (
     ('left', 'SHL', 'SHR'),
     ('left', 'PLUS', 'MINUS'),
     ('left', 'MUL', 'DIV', 'MOD'),
+    ('left', 'AS'),
     ('right', 'UNARY', 'LOGICAL_NOT', 'BIT_NOT'),
     ('left', 'DOT', 'ARROW'),
 )
 ```
 
-**PLY orders precedence from lowest (first) to highest (last).** So `DOT`/`ARROW` bind tightest; assignment binds loosest.
+**PLY orders precedence from lowest (first) to highest (last).** So `DOT`/`ARROW` bind tightest; assignment binds loosest. `AS` sits just above multiplicative operators, so `a * b as T` parses as `a * (b as T)` and `a as T * b` parses as `(a as T) * b` only via the cast_type ambiguity note in §4.11.
 
 **To add a new operator:**
 1. Add its token to `lexer.py` and `tokens`.
@@ -119,6 +124,25 @@ Each `p_<name>` function is a production group. `p[0]` is the result; `p[1..n]` 
 - `p_statement_list`: right-growing list. `empty` produces `[]`.
 - `p_statement`: the union of all statement forms. **To add a new statement form**, add its non-terminal to this list.
 
+`p_statement` currently includes:
+
+```
+function_decl
+var_decl SEMI
+typedef_decl SEMI
+struct_decl
+enum_decl
+if_statement
+while_statement
+for_statement
+return_statement SEMI
+break_statement SEMI
+continue_statement SEMI
+asm_statement SEMI
+expr_statement SEMI
+block
+```
+
 **Tip:** `p_statement` is where you declare new top-level-or-nested statement kinds. If your new construct is only valid at the top level (e.g. `import`), you'd instead add a dedicated rule to `p_program` or introduce a `top_level_statement` non-terminal.
 
 ### 4.2 Functions
@@ -140,7 +164,19 @@ function_decl : DEF IDENT '(' parameter_list ')' ARROW type block
 
 **To add variadics** (`...`): add a token in the lexer and a production here; then decide how codegen lowers it (C varargs ABI or explicit slice pointer).
 
-### 4.4 Variable declarations
+### 4.4 Typedefs
+
+```
+typedef_decl : KEYWORD_TYPEDEF IDENT ASSIGN type
+```
+
+Produces `TypedefNode(name, target_type)`. The target is a raw type string, resolved lazily by `codegen._get_llvm_type` whenever the alias name is used. This means a typedef may point to a struct/enum declared later in the source, and forward references through aliases work naturally.
+
+**To add typedef validation at parse time:** add a check in `p_typedef_decl`. Codegen already raises on duplicate and circular typedefs, so parser-side checks are only for early diagnostics.
+
+**To add parameterized aliases** (`typedef Vec<T> = ...`): would require a `type_params` non-terminal and substitution in codegen — significant work.
+
+### 4.5 Variable declarations
 
 ```
 var_decl : LET IDENT COLON type ASSIGN expression
@@ -154,7 +190,7 @@ var_decl : LET IDENT COLON type ASSIGN expression
 
 **To add `const`:** same approach — new token, new alternatives, new AST field.
 
-### 4.5 Structs
+### 4.6 Structs
 
 ```
 struct_decl : KEYWORD_STRUCT IDENT '{' struct_field_list '}'
@@ -175,7 +211,7 @@ Do the same for `enum_variant_list`, `parameter_list`, and `arg_list` if you wan
 
 **To add generics:** `struct Foo<T> { ... }` requires a `type_params` non-terminal and monomorphization in codegen (or pointer erasure).
 
-### 4.6 Enums
+### 4.7 Enums
 
 ```
 enum_decl : KEYWORD_ENUM IDENT '{' enum_variant_list '}'
@@ -188,7 +224,7 @@ enum_decl : KEYWORD_ENUM IDENT '{' enum_variant_list '}'
 
 **To add payload variants** (Rust-style `Some(int)`): change `p_enum_variant` to accept an optional `'(' type_list ')'` and store `(name, explicit_value, payload_types)`. Codegen's enum handling currently only emits integers — you'd need to switch to a tagged union (struct with tag + union). This is a significant change touching `visit_EnumDeclNode`, `_get_llvm_type`, `visit_IdentifierNode`, and `_resolve_enum_member`.
 
-### 4.7 Control flow
+### 4.8 Control flow
 
 #### If / else
 
@@ -224,7 +260,7 @@ Each of `for_init`, `for_condition`, `for_update` accepts `empty`, so `for(;;)` 
 
 Simple. `p_return_statement` allows bare `return;` (which produces `ReturnNode(None)`).
 
-### 4.8 Inline assembly
+### 4.9 Inline assembly
 
 The asm grammar builds a **dict** in `p_asm_field` (`{'template': ...}`, `{'outputs': [...]}`, etc.), which `p_asm_field_list` merges via `dict.update`. `p_asm_statement` then reads the dict.
 
@@ -236,18 +272,19 @@ The asm grammar builds a **dict** in `p_asm_field` (`{'template': ...}`, `{'outp
 
 **To add memory operands** (`"=m"(x)`): the operand production already accepts any expression, so `x` parses fine. Codegen would need to pass the *address* instead of the *value* when the constraint is `m`-family. That's a codegen-only change.
 
-### 4.9 Blocks and expression statements
+### 4.10 Blocks and expression statements
 
 - `p_block`: `'{' statement_list '}'` → `BlockNode`.
 - `p_expr_statement`: any expression followed by a `SEMI` (from `p_statement`) becomes a statement. Its value is discarded.
 
 **Note:** `p_expr_statement` has no dedicated node — it just returns the expression. Codegen's `visit_BinaryOpNode` (assignment), `visit_FnCallNode`, etc. handle it. If you want to reject bare expressions that aren't calls/assignments (like C compilers warn about), add a validation pass or wrap in a new `ExprStmtNode`.
 
-### 4.10 Types
+### 4.11 Types
 
 ```
 type : TYPE_FLOAT | TYPE_DOUBLE | TYPE_VOID | IDENT | IDENT MUL
 type : '[' NUMBER IDENT type ']'    # array types
+type : LT NUMBER IDENT type GT      # vector types
 ```
 
 **Important:** `i32`, `i8`, `ptr`, `string`, `half`, `bfloat`, `fp128`, etc. are **not reserved words**. They lex as `IDENT` and are resolved by `codegen._get_llvm_type` (via `type_map` or the `iN` regex). This is deliberate: it lets the language add integer widths without touching the lexer.
@@ -259,13 +296,37 @@ type : '[' NUMBER IDENT type ']'    # array types
 2. Choose the string encoding (e.g. `"fn(i32)->i32"`).
 3. Teach `codegen._get_llvm_type` to parse it.
 
-Currently the array rule uses `'[' NUMBER IDENT type ']'` — the `x` in `[512 x i8]` lexes as `IDENT` because `x` isn't reserved. That's a hack; if you add `x` as a keyword elsewhere, this rule breaks. Consider replacing `IDENT` with a dedicated token or accepting `'x'` literal.
+**Array rule:** `'[' NUMBER IDENT type ']'` — the `x` in `[512 x i8]` lexes as `IDENT` because `x` isn't reserved. That's a hack; if you add `x` as a keyword elsewhere, this rule breaks. Consider replacing `IDENT` with a dedicated token or accepting `'x'` literal.
 
-**Nested arrays and vectors:** `[4 x [4 x i32]]` parses because `type` is recursive. Vectors (`<4 x float>`) are **not** currently parseable — the grammar has no `'<' type '>'` production. To add vectors, add a production here and a matching branch in `_get_llvm_type` (the regex already exists).
+**Vector rule:** `<N x T>` mirrors the array rule, reusing `LT`/`GT`. Because `type` is only entered from fixed points (after `COLON`, after `ARROW`, or recursively as an array/vector element type) and never from inside `expression`, this doesn't create shift/reduce ambiguity with `LT`/`GT`'s use as comparison operators.
+
+**Nested arrays and vectors:** `[4 x [4 x i32]]` and `<4 x <4 x float>>` parse because `type` is recursive on both branches. Codegen's `_get_llvm_type` already handles both via its `array_match` and `vector_match` regexes.
 
 **Pointer types:** only one level of `*` is supported (`IDENT MUL`). `T**` does not parse. If you need multi-level pointers, either extend to `IDENT MUL MUL` or make a dedicated pointer production: `type : type MUL`. The latter is cleaner but interacts with the array/vector productions' ambiguity.
 
-### 4.11 Expressions
+### 4.12 Cast expressions
+
+```
+expression : expression AS cast_type %prec AS
+```
+
+`cast_type` is a **self-contained duplicate of `type`** used only after `AS`. Reusing `type` itself here would make it reachable from inside `expression`, enlarging `FOLLOW(type)` to include every binary-operator token; since LALR states merge by grammar position, that would make `type -> IDENT .` also treat `MUL` as a possible lookahead in the plain declaration contexts (var decl, params, struct fields, …), where `MUL` is not actually meaningful.
+
+Keeping `cast_type` separate confines the one resulting ambiguity to casts alone: with `x as T .` and a `MUL` lookahead, the parser can't tell whether `MUL` starts a pointer type (`x as T*`) or is multiplication following a finished cast (`x as T * y`); it defaults to shift (pointer type wins), so wrap the cast in parens when multiplication is intended: `(x as T) * y`.
+
+`p_expression_cast` uses `%prec AS` because the rule's rightmost symbol is the nonterminal `cast_type`, which carries no precedence of its own; without `%prec`, PLY would fall back to no precedence for this production and could not resolve its shift/reduce interaction with the surrounding binary-operator rules the same way the `AS` entry in the precedence table intends.
+
+`cast_type` supports the same shapes as `type`:
+
+```
+cast_type : TYPE_FLOAT | TYPE_DOUBLE | TYPE_VOID | IDENT | IDENT MUL
+cast_type : '[' NUMBER IDENT cast_type ']'   # array
+cast_type : LT NUMBER IDENT cast_type GT      # vector
+```
+
+**To add a new cast target shape:** extend both `p_type` and `p_cast_type` (and any recursive array/vector variants). They are intentionally kept in sync by duplication, not by sharing a non-terminal.
+
+### 4.13 Expressions
 
 `p_expression_binop` covers all binary operators in one production group — PLY uses `precedence` to resolve. **To add a new binary operator**, just add it to this list and to `precedence`.
 
@@ -280,11 +341,11 @@ Currently the array rule uses `'[' NUMBER IDENT type ']'` — the `x` in `[512 x
 
 **Note on `p_expression_member`:** `DOT` and `ARROW` are collapsed into one production that sets `through_pointer`. Both left-associate, so `a.b.c` and `a->b->c` work, but mixed chains like `a.b->c` are also accepted (parsed left-to-right). Codegen's `_member_address` handles the `through_pointer` at each step.
 
-### 4.12 Argument lists
+### 4.14 Argument lists
 
 `p_arg_list` / `p_arg_list_nonempty` — same pattern as parameter lists. `empty` for zero-arg calls.
 
-### 4.13 `empty` and error handling
+### 4.15 `empty` and error handling
 
 `p_empty` defines the `empty` non-terminal used everywhere. It has no value.
 
@@ -309,6 +370,8 @@ Built at import time. Options you might add:
 **Tip:** after editing the grammar, delete `parsetab.py` if PLY caches it, or pass `write_tables=False` to force regeneration. Stale tables cause mysterious behavior.
 
 **Watching for conflicts:** run with `debug=True` and check `parser.out` for "conflict" messages. Shift/reduce conflicts usually indicate an ambiguous precedence. Reduce/reduce conflicts are almost always a real grammar bug.
+
+**The `cast_type` split was introduced specifically to avoid one such conflict.** If you later see new conflicts after touching `p_type`, `p_cast_type`, or the `AS` precedence row, that's the first place to look.
 
 ---
 
@@ -388,6 +451,13 @@ Alternatively, keep the string and add a separate node `IndirectCallNode(callee_
 
 This interacts with `p_expression_group` (single-element `(x)`). PLY will see a shift/reduce conflict; resolve by making the tuple production require a trailing comma (`(x,)`) or by using lookahead.
 
+### 6.9 Add a new cast target shape
+
+1. Parser: extend both `p_type` and `p_cast_type` (including the recursive `p_cast_type_array` / `p_cast_type_vector` variants) with the new shape.
+2. Codegen: teach `_get_llvm_type` to parse the new encoding, and make sure `_coerce` handles the resulting `ir.Type` category.
+
+Keep `p_type` and `p_cast_type` in sync by hand. They are duplicated on purpose (see §4.12) — do not merge them into a shared non-terminal without re-checking the `FOLLOW` set implications for `MUL`.
+
 ---
 
 ## 7. Debugging Tips
@@ -403,6 +473,7 @@ This interacts with `p_expression_group` (single-element `(x)`). PLY will see a 
 - **Find conflicts:** build with `yacc.yacc(debug=True)` and inspect `parser.out`.
 - **Stale tables:** if the grammar changes but behavior doesn't, delete `parsetab.py`.
 - **Token-name mismatches:** if a rule "never fires", verify the token name matches `tokens` exactly (case-sensitive). PLY silently ignores unknown token names in rule docstrings only if they aren't defined; misspellings become non-terminals and cause conflicts or errors at build time.
+- **Cast ambiguity:** if `x as T * y` parses unexpectedly, that's the documented shift-toward-pointer-type behavior (§4.12). Wrap the cast in parens to force multiplication.
 
 ---
 
@@ -411,13 +482,15 @@ This interacts with `p_expression_group` (single-element `(x)`). PLY will see a 
 1. **`p_statement` is the union of all statement forms.** Add new statements there (or to a new `top_level_statement` if scope-restricted).
 2. **`p_expression_binop` uses `precedence` for disambiguation.** Add operators to both.
 3. **`%prec UNARY` for prefix operators that share a token with a binary form** (`&`, `*`). Forget it and you get shift/reduce conflicts.
-4. **Type names are `IDENT`s**, not keywords — with the exception of `float`, `double`, `void`. Keep it that way; it's what lets codegen own the type map.
-5. **`LiteralNode.value` is a raw string.** Don't convert in the parser.
-6. **`AsmOperandNode.constraint` is a quoted token.** Decode in codegen.
-7. **`else if` chains produce nested `IfNode`s** — do not flatten them in the parser; codegen relies on recursion.
-8. **`for_init` accepts `var_decl` without `SEMI`** because the `for` production supplies it.
-9. **The `empty` non-terminal exists globally.** Reuse it for optional slots rather than duplicating "list may be absent" logic.
-10. **No semantic analysis happens here.** No type checking, no name resolution, no constant folding. Keep it that way.
+4. **`%prec AS` on `p_expression_cast`.** The rightmost symbol is a nonterminal (`cast_type`); without the override, PLY has no precedence to apply.
+5. **`p_cast_type` is a deliberate duplicate of `p_type`, not a shared non-terminal.** Merging them reintroduces the `FOLLOW(type)` ambiguity with `MUL` in declaration contexts. Keep the two in sync by hand.
+6. **Type names are `IDENT`s**, not keywords — with the exception of `float`, `double`, `void`. Keep it that way; it's what lets codegen own the type map.
+7. **`LiteralNode.value` is a raw string.** Don't convert in the parser.
+8. **`AsmOperandNode.constraint` is a quoted token.** Decode in codegen.
+9. **`else if` chains produce nested `IfNode`s** — do not flatten them in the parser; codegen relies on recursion.
+10. **`for_init` accepts `var_decl` without `SEMI`** because the `for` production supplies it.
+11. **The `empty` non-terminal exists globally.** Reuse it for optional slots rather than duplicating "list may be absent" logic.
+12. **No semantic analysis happens here.** No type checking, no name resolution, no constant folding. Keep it that way.
 
 ---
 
@@ -426,19 +499,19 @@ This interacts with `p_expression_group` (single-element `(x)`). PLY will see a 
 - No `let mut` despite the AST field existing — `is_mutable` is always `False`.
 - No compound assignment (`+=`, `-=`, ...) parsing, even though the lexer defines the tokens and they're in `precedence`. `p_expression_binop` doesn't include them.
 - No array indexing (`arr[i]`).
-- No vector literal type syntax (`<4 x float>`), though codegen supports vectors.
 - Only one level of pointer (`T*`, not `T**`).
 - No function pointers, no closures, no generics.
 - No module/import system.
 - No `match`/`switch` statement.
-- No explicit cast syntax (`as`).
 - No `enum` payloads (tagged unions).
 - Trailing commas are inconsistent across list-like productions.
 - `p_error` doesn't recover or raise.
 - Literal type discrimination is codegen's heuristic (`"." in value` → double), not the parser's.
+- Cast syntax has a documented ambiguity with multiplication when the target type can be followed by `*` (`x as T * y`); the parser resolves it in favor of the pointer type. Parenthesize to disambiguate.
 
 If you extend the language, prefer:
 
 1. Adding a **new AST node** over overloading an existing one.
 2. Adding a **new production group** over growing an existing rule.
 3. Keeping the parser **purely structural**; push semantic decisions into `codegen.py`.
+4. **Mirroring new type shapes in both `p_type` and `p_cast_type`** rather than sharing a non-terminal.

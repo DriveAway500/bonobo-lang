@@ -14,6 +14,7 @@ from parser import (
     BinaryOpNode,
     BlockNode,
     BreakNode,
+    CastNode,
     ContinueNode,
     EnumDeclNode,
     FnCallNode,
@@ -26,6 +27,7 @@ from parser import (
     ProgramNode,
     ReturnNode,
     StructDeclNode,
+    TypedefNode,
     UnaryOpNode,
     VarDeclNode,
     WhileNode,
@@ -40,17 +42,15 @@ _LLVM_INITIALIZED = False
 
 
 def initialize_llvm() -> None:
-    """Initialize LLVM's native target support once per process."""
+    """Initialize LLVM's native target support once per process.
+
+    Modern llvmlite (0.44+) initializes core LLVM automatically, so the
+    legacy ``llvm.initialize()`` call is no longer made — calling it now
+    only raises a deprecation error.
+    """
     global _LLVM_INITIALIZED
     if _LLVM_INITIALIZED:
         return
-    try:
-        llvm.initialize()
-    except RuntimeError as error:
-        # llvmlite 0.49+ initializes LLVM automatically and rejects the
-        # legacy call; older supported versions still require it.
-        if "initialization is now handled automatically" not in str(error):
-            raise
     llvm.initialize_native_target()
     llvm.initialize_native_asmprinter()
     _LLVM_INITIALIZED = True
@@ -109,12 +109,19 @@ class LLVMCodeGenerator:
         # enum's own name to that type — mirrors how struct_types backs
         # struct names — so it resolves wherever a type is expected
         # (params, fields, var decls, return types). enum_value_types keeps
-        # the same per-entry type alongside enum_values (bare and qualified
-        # variant names) so a constant is always built with the right width.
+        # the same per-entry type alongside enum_values, keyed by each
+        # variant's qualified "Enum.Variant" name only (see
+        # visit_EnumDeclNode), so a constant is always built with the
+        # right width.
         self.enum_underlying_types: Dict[str, ir.Type] = {}
         self.enum_value_types: Dict[str, ir.Type] = {}
         self.pointer_pointees: Dict[str, ir.Type] = {}
         self.string_constants: Dict[str, ir.GlobalVariable] = {}
+        # typedef NAME = <type>; maps NAME to the raw type string it
+        # aliases. Resolved lazily (and recursively) by _get_llvm_type,
+        # so a typedef may point to a struct/enum declared later in the
+        # source, same as any other type reference.
+        self.type_aliases: Dict[str, str] = {}
 
     @staticmethod
     def _optional_llvm_type(type_name: str) -> Optional[ir.Type]:
@@ -124,6 +131,12 @@ class LLVMCodeGenerator:
     def _get_llvm_type(self, type_str: Optional[str]) -> ir.Type:
         if not type_str:
             return self.type_map["i32"]
+        seen_aliases = set()
+        while type_str in self.type_aliases:
+            if type_str in seen_aliases:
+                raise CodeGenError(f"Circular typedef involving '{type_str}'")
+            seen_aliases.add(type_str)
+            type_str = self.type_aliases[type_str]
         if type_str in self.type_map:
             return self.type_map[type_str]
         if type_str in self.struct_types:
@@ -340,23 +353,16 @@ class LLVMCodeGenerator:
         optimized_module.verify()
 
         target_machine = llvm.Target.from_default_triple().create_target_machine()
-        if hasattr(llvm, "PassManagerBuilder"):
-            pass_manager_builder = llvm.PassManagerBuilder()
-            pass_manager_builder.opt_level = opt_level
-            module_pass_manager = llvm.ModulePassManager()
-            target_machine.add_analysis_passes(module_pass_manager)
-            pass_manager_builder.populate(module_pass_manager)
-            module_pass_manager.run(optimized_module)
-        else:
-            # LLVM 22 removed the legacy PassManagerBuilder API. Its new
-            # pipeline exposes speed levels 0..2, so O3 uses the strongest
-            # available default pipeline just like O2 on that API.
-            tuning_options = llvm.create_pipeline_tuning_options(
-                speed_level=min(opt_level, 2)
-            )
-            pass_builder = llvm.create_pass_builder(target_machine, tuning_options)
-            module_pass_manager = pass_builder.getModulePassManager()
-            module_pass_manager.run(optimized_module, pass_builder)
+        # New pass-manager pipeline only (the legacy PassManagerBuilder API
+        # was removed from llvmlite/LLVM and is no longer supported here).
+        # Its speed levels only go up to 2, so O3 uses the strongest
+        # available default pipeline, same as O2 on this API.
+        tuning_options = llvm.create_pipeline_tuning_options(
+            speed_level=min(opt_level, 2)
+        )
+        pass_builder = llvm.create_pass_builder(target_machine, tuning_options)
+        module_pass_manager = pass_builder.getModulePassManager()
+        module_pass_manager.run(optimized_module, pass_builder)
         optimized_module.verify()
         return str(optimized_module)
 
@@ -366,6 +372,13 @@ class LLVMCodeGenerator:
     # ---- AST Node Visitors --------------------------------------------------
 
     def visit_ProgramNode(self, node: ProgramNode) -> ir.Module:
+        # Typedefs first: they're pure name substitutions resolved lazily
+        # by _get_llvm_type, so registering all of them up front lets any
+        # later declaration (enum, struct, function, var) reference an
+        # alias regardless of source order, same reasoning as enums below.
+        for stmt in node.statements:
+            if isinstance(stmt, TypedefNode):
+                self.generate(stmt)
         # Enums first: they have no dependencies on other declarations and
         # resolve to a plain integer type, so registering all of them up
         # front lets struct fields / function signatures reference an enum
@@ -384,6 +397,11 @@ class LLVMCodeGenerator:
             if isinstance(stmt, FunctionDeclNode):
                 self._define_function(stmt)
         return self.module
+
+    def visit_TypedefNode(self, node: TypedefNode) -> None:
+        if node.name in self.type_aliases:
+            raise CodeGenError(f"Duplicate typedef: {node.name}")
+        self.type_aliases[node.name] = node.target_type
 
     def visit_StructDeclNode(self, node: StructDeclNode):
         struct_type = self.module.context.get_identified_type(node.name)
@@ -416,11 +434,19 @@ class LLVMCodeGenerator:
             if explicit_value is not None:
                 next_value = explicit_value
             qualified_name = f"{node.name}.{name}"
-            if name in self.enum_values or qualified_name in self.enum_values:
+            # Duplicate check is scoped to this enum's own variants only
+            # (self.enum_types[node.name]), not to the global enum_values
+            # table: variants are namespaced by their enum, so two
+            # different enums may freely reuse the same variant name,
+            # exactly like two different structs may reuse a field name.
+            if name in self.enum_types[node.name]:
                 raise CodeGenError(f"Duplicate enum variant: {name}")
-            self.enum_values[name] = next_value
+            # Only the qualified name ("Enum.Variant") is registered here.
+            # Variants are intentionally NOT reachable by their bare name
+            # (see visit_IdentifierNode): they must always be accessed
+            # through their enum, the same way struct fields must always
+            # be accessed through a struct instance ("point.x", not "x").
             self.enum_values[qualified_name] = next_value
-            self.enum_value_types[name] = underlying_type
             self.enum_value_types[qualified_name] = underlying_type
             self.enum_types[node.name][name] = next_value
             next_value += 1
@@ -478,16 +504,17 @@ class LLVMCodeGenerator:
         alloca = self.builder.alloca(llvm_type, name=node.name)
 
         if value is not None:
-            if isinstance(llvm_type, ir.ArrayType):
-                # Array locals are declared with a placeholder scalar
-                # initializer (e.g. "let buf: [512 x i8] = 0;") that just
-                # reserves the stack space; it isn't coercible into the
-                # array type itself. We deliberately do NOT emit a store of
-                # a zeroinitializer constant here: for buffers this large,
-                # LLVM's backend lowers a single big aggregate store into a
-                # call to memset(), which fails to link in a freestanding
-                # binary (no libc, custom _start, raw syscalls). Programs
-                # using these scratch buffers are expected to fill them
+            if isinstance(llvm_type, (ir.ArrayType, ir.VectorType)):
+                # Array/vector locals are declared with a placeholder scalar
+                # initializer (e.g. "let buf: [512 x i8] = 0;" or
+                # "let v: <4 x i32> = 0;") that just reserves the stack
+                # space; it isn't coercible into the aggregate type itself.
+                # We deliberately do NOT emit a store of a zeroinitializer
+                # constant here: for buffers this large, LLVM's backend
+                # lowers a single big aggregate store into a call to
+                # memset(), which fails to link in a freestanding binary
+                # (no libc, custom _start, raw syscalls). Programs using
+                # these scratch buffers/vectors are expected to fill them
                 # explicitly before reading, as this source already does.
                 pass
             else:
@@ -674,6 +701,19 @@ class LLVMCodeGenerator:
             return self.builder.not_(value)
         raise CodeGenError(f"Unary operator {node.op} not implemented for {value.type}")
 
+    def visit_CastNode(self, node: CastNode) -> ir.Value:
+        """Explicit "expr as T" cast. Reuses the same _coerce logic that
+        already backs every implicit conversion in this language (var-decl
+        initializers, assignments, call arguments, returns), so a cast
+        supports exactly the conversions that were already legal
+        elsewhere: integer widen/narrow, int<->float, int<->pointer, and
+        pointer<->pointer, always using signed semantics like the rest of
+        the language (this language doesn't distinguish signed/unsigned
+        integer types, see the note on `conversion_map` above)."""
+        value = self.generate(node.expression)
+        target_type = self._get_llvm_type(node.target_type)
+        return self._coerce(value, target_type)
+
     def visit_LiteralNode(self, node: LiteralNode) -> ir.Constant:
         value = node.value
         if isinstance(value, str) and value.startswith('"') and value.endswith('"'):
@@ -694,8 +734,9 @@ class LLVMCodeGenerator:
 
     def visit_IdentifierNode(self, node: IdentifierNode) -> ir.Instruction:
         if node.name not in self.symbol_table:
-            if node.name in self.enum_values:
-                return ir.Constant(self.enum_value_types[node.name], self.enum_values[node.name])
+            # Enum variants are intentionally not resolved here: they are
+            # namespaced under their enum (see visit_EnumDeclNode) and must
+            # be reached through it, e.g. "Color.Red", never bare "Red".
             raise CodeGenError(f"Undefined variable: {node.name}")
         ptr = self.symbol_table[node.name]
         return self.builder.load(ptr, typ=self.symbol_types[node.name], name=node.name)
