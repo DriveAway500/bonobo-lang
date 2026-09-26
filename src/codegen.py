@@ -22,6 +22,7 @@ from parser import (
     FunctionDeclNode,
     IdentifierNode,
     IfNode,
+    IndexNode,
     LiteralNode,
     MemberAccessNode,
     ProgramNode,
@@ -632,6 +633,11 @@ class LLVMCodeGenerator:
                 value = self._coerce(self.generate(node.right), target_type)
                 self.builder.store(value, target_address)
                 return value
+            if isinstance(node.left, IndexNode):
+                target_address, target_type = self._index_address(node.left)
+                value = self._coerce(self.generate(node.right), target_type)
+                self.builder.store(value, target_address)
+                return value
             if not isinstance(node.left, IdentifierNode) or node.left.name not in self.symbol_table:
                 raise CodeGenError("Assignment target must be a declared variable or struct member")
             target_type = self.symbol_types[node.left.name]
@@ -739,7 +745,17 @@ class LLVMCodeGenerator:
             # be reached through it, e.g. "Color.Red", never bare "Red".
             raise CodeGenError(f"Undefined variable: {node.name}")
         ptr = self.symbol_table[node.name]
-        return self.builder.load(ptr, typ=self.symbol_types[node.name], name=node.name)
+        element_type = self.symbol_types[node.name]
+        if isinstance(element_type, ir.ArrayType):
+            # Array-to-pointer decay (as in C): the *value* of an array-typed
+            # expression is the address of its first element, not the whole
+            # array loaded onto the stack. With opaque pointers that address
+            # is exactly the variable's own storage pointer, so this lets
+            # e.g. "sys_write(1, drawbuffer.buffer, ...)" pass a `buf4096`
+            # field straight through to a `ptr` parameter via the normal
+            # pointer->pointer path in _coerce.
+            return ptr
+        return self.builder.load(ptr, typ=element_type, name=node.name)
 
     def visit_FnCallNode(self, node: FnCallNode) -> ir.Instruction:
         if node.name in self.struct_types:
@@ -814,7 +830,51 @@ class LLVMCodeGenerator:
             return self.symbol_table[node.name], self.symbol_types[node.name]
         if isinstance(node, MemberAccessNode):
             return self._member_address(node)
+        if isinstance(node, IndexNode):
+            return self._index_address(node)
         raise CodeGenError("A struct member base must be a variable or another member")
+
+    def _index_address(self, node: IndexNode) -> Tuple[ir.Value, ir.Type]:
+        """Return the address and type of base[index], e.g. "buffer[i]" or
+        "drawbuffer->buffer[i]". Mirrors _member_address: it resolves the
+        base to an address first (so indexing composes with '.'/'->'), then
+        GEPs into it."""
+        base_address, base_type = self._address_of(node.base)
+        index_value = self._coerce(self.generate(node.index), ir.IntType(32))
+
+        if isinstance(base_type, ir.ArrayType):
+            zero = ir.Constant(ir.IntType(32), 0)
+            gep_args = {"inbounds": True, "name": "idx_addr"}
+            if getattr(base_address.type, "is_opaque", False):
+                gep_args["source_etype"] = base_type
+            address = self.builder.gep(base_address, [zero, index_value], **gep_args)
+            return address, base_type.element
+
+        if self._is_pointer(base_type):
+            # Indexing a variable that itself holds a pointer (e.g.
+            # "buf: ptr"): load the pointer value, then step off it. This
+            # language treats raw pointers as opaque i8*, so the element
+            # type defaults to i8 unless a more specific pointee is known.
+            pointer_value = self.builder.load(base_address, typ=base_type, name="idx_base_ptr")
+            pointee_type = ir.IntType(8)
+            if isinstance(node.base, IdentifierNode):
+                pointee_type = self.pointer_pointees.get(node.base.name, pointee_type)
+            gep_args = {"inbounds": True, "name": "idx_addr"}
+            if getattr(pointer_value.type, "is_opaque", False):
+                gep_args["source_etype"] = pointee_type
+            address = self.builder.gep(pointer_value, [index_value], **gep_args)
+            return address, pointee_type
+
+        raise CodeGenError(f"Cannot index into type {base_type}")
+
+    def visit_IndexNode(self, node: IndexNode) -> ir.Value:
+        address, element_type = self._index_address(node)
+        if isinstance(element_type, ir.ArrayType):
+            # Same array-to-pointer decay as visit_IdentifierNode, for
+            # multi-dimensional arrays (e.g. "matrix[i]" where matrix is
+            # "[N x [M x i32]]").
+            return address
+        return self.builder.load(address, typ=element_type, name="idx")
 
     def visit_MemberAccessNode(self, node: MemberAccessNode) -> ir.Value:
         if isinstance(node.value, IdentifierNode):
@@ -823,6 +883,10 @@ class LLVMCodeGenerator:
             if qualified_name in self.enum_values:
                 return self._resolve_enum_member(enum_name, node.member)
         address, field_type = self._member_address(node)
+        if isinstance(field_type, ir.ArrayType):
+            # Array-to-pointer decay, e.g. "drawbuffer.buffer" /
+            # "drawbuffer->buffer" where "buffer" is a "buf4096" field.
+            return address
         return self.builder.load(address, typ=field_type, name=node.member)
 
     def visit_ReturnNode(self, node: ReturnNode) -> ir.Instruction:

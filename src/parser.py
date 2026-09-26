@@ -126,6 +126,11 @@ class FnCallNode(ASTNode):
         self.name = name
         self.args = args
 
+class IndexNode(ASTNode):
+    def __init__(self, base, index):
+        self.base = base
+        self.index = index
+
 class CastNode(ASTNode):
     def __init__(self, expression, target_type):
         self.expression = expression
@@ -236,10 +241,14 @@ def p_struct_decl(p):
 
 def p_struct_field_list(p):
     '''struct_field_list : struct_field_list COMMA struct_field
+                         | struct_field_list COMMA
                          | struct_field
                          | empty'''
     if len(p) == 4:
         p[0] = p[1] + [p[3]]
+    elif len(p) == 3:
+        # Trailing comma after the last field, e.g. "struct S { a: int, }".
+        p[0] = p[1]
     elif len(p) == 2 and p[1] is not None:
         p[0] = [p[1]]
     else:
@@ -259,10 +268,14 @@ def p_enum_decl(p):
 
 def p_enum_variant_list(p):
     '''enum_variant_list : enum_variant_list COMMA enum_variant
+                         | enum_variant_list COMMA
                          | enum_variant
                          | empty'''
     if len(p) == 4:
         p[0] = p[1] + [p[3]]
+    elif len(p) == 3:
+        # Trailing comma after the last variant.
+        p[0] = p[1]
     elif len(p) == 2 and p[1] is not None:
         p[0] = [p[1]]
     else:
@@ -540,6 +553,14 @@ def p_expression_member(p):
     '''expression : expression DOT IDENT
                   | expression ARROW IDENT'''
     p[0] = MemberAccessNode(p[1], p[3], through_pointer=p[2] == '->')
+
+# Array/pointer indexing: base[index], e.g. "drawbuffer->buffer[i]".
+# %prec UNARY keeps '[' binding as tightly as possible against the
+# expression on its left, mirroring how DOT/ARROW already behave, and
+# avoids reopening the array-type '[' ... ']' rules to expression contexts.
+def p_expression_index(p):
+    '''expression : expression '[' expression ']' %prec UNARY'''
+    p[0] = IndexNode(p[1], p[3])
 
 def p_arg_list(p):
     '''arg_list : arg_list_nonempty

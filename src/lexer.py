@@ -85,9 +85,18 @@ def t_IDENT(t):
     t.type = reserved.get(t.value, 'IDENT')
     return t
 
-# Ignored characters (whitespace and single-line comments)
-t_ignore = ' \t\n'
+# Ignored characters (whitespace, NOT newlines -- those are counted below
+# by t_newline so PLY's line tracking actually works)
+t_ignore = ' \t'
 t_ignore_COMMENT = r'//.*'
+
+# Newlines were previously part of t_ignore, which means PLY discarded them
+# silently and t.lexer.lineno was never advanced -- every token, and every
+# syntax error reported from the parser, was stuck on line 1. This rule
+# takes over counting newlines explicitly.
+def t_newline(t):
+    r'\n+'
+    t.lexer.lineno += len(t.value)
 
 def t_error(t):
     print(f"Illegal character '{t.value[0]}'")
